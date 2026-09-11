@@ -39,8 +39,8 @@ type Options struct {
 	IdempotencyKey string
 }
 type EmbedResult struct {
-	Bytes                                         []byte
-	WatermarkID, RequestID, ContentType, Filename string
+	Bytes                                                                 []byte
+	WatermarkID, RequestID, ContentType, Filename, AssetID, SourceAssetID string
 }
 type DetectionUnit struct {
 	Index       int     `json:"index"`
@@ -218,7 +218,7 @@ func (c *Client) request(parent context.Context, path, method string, body []byt
 		if len(b) > MaxFileSize {
 			return nil, nil, &Error{res.StatusCode, "Response exceeds 20 MB", requestID, key}
 		}
-		if res.StatusCode == 200 {
+		if res.StatusCode == 200 || res.StatusCode == 204 {
 			return b, res.Header, nil
 		}
 		var detail struct {
@@ -267,7 +267,7 @@ func embedding(b []byte, h http.Header) (*EmbedResult, error) {
 	if m := safeFilename.FindStringSubmatch(h.Get("Content-Disposition")); m != nil {
 		filename = m[1]
 	}
-	return &EmbedResult{b, h.Get("X-Watermark-ID"), h.Get("X-Request-ID"), mime, filename}, nil
+	return &EmbedResult{b, h.Get("X-Watermark-ID"), h.Get("X-Request-ID"), mime, filename, h.Get("X-Asset-ID"), h.Get("X-Source-Asset-ID")}, nil
 }
 func validDetection(raw json.RawMessage) bool {
 	var d struct {

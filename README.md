@@ -5,7 +5,7 @@ Official server-side client for image, PDF and video watermarking. Go 1.25+. MIT
 ## Install
 
 ```sh
-go get github.com/etchv-labs/go-sdk@v0.1.0
+go get github.com/etchv-labs/go-sdk@v0.2.0
 ```
 
 ## Example
@@ -103,3 +103,30 @@ go test -race ./...
 This public repository is synchronized from the Etchv development monorepo. Issues and pull
 requests are welcome; maintainers incorporate accepted changes into the source before publishing
 the next snapshot. The MIT license covers this SDK, not the hosted service.
+
+## Asset library
+
+New successful embeddings save original and verified output assets. Files remain
+downloadable for 30 days; records stay until deleted. Use `assets:read` for listing,
+inspection and downloads, `assets:write` for edits, and `assets:delete` with current
+owner/admin membership for deletion. Existing keys need replacement to add scopes.
+
+```go
+page, err := client.ListAssets(ctx, etchv.AssetListOptions{Kind: "watermarked", Limit: 25})
+if err != nil { return err }
+for _, item := range page.Items {
+    asset, err := client.GetAsset(ctx, item.ID)
+    if err != nil { return err }
+    _, err = client.UpdateAsset(ctx, asset.ID, asset.Version,
+        map[string]any{"metadata": map[string]any{"campaign": "spring"}})
+    if err != nil { return err }
+}
+// DownloadAsset(ctx, id) returns file bytes. NextCursor continues the same filters.
+```
+
+Edits require the current version; reload and reconcile on HTTP 409. Metadata is
+replaced, not merged, and does not change the embedded watermark. Asset operations
+consume no credits. Downloads require authentication and return the original file
+format. Single and bulk deletion methods are also available; batches contain at
+most 50 IDs and delete atomically. Deleting an output blocks its job result replay.
+See [the asset API](https://etchv.com/docs/api/assets) for the complete contract.
