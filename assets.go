@@ -9,24 +9,30 @@ import (
 )
 
 type Asset struct {
-	ID            string         `json:"id"`
-	Name          string         `json:"name"`
-	Kind          string         `json:"kind"`
-	MediaType     string         `json:"media_type"`
-	Format        string         `json:"format"`
-	ContentType   string         `json:"content_type"`
-	SizeBytes     int64          `json:"size_bytes"`
-	SHA256        string         `json:"sha256"`
-	ParentAssetID *string        `json:"parent_asset_id"`
-	RequestID     string         `json:"request_id"`
-	WatermarkID   *string        `json:"watermark_id"`
-	CreatedAt     string         `json:"created_at"`
-	UpdatedAt     string         `json:"updated_at"`
-	FileExpiresAt string         `json:"file_expires_at"`
-	FileAvailable bool           `json:"file_available"`
-	Version       int            `json:"version"`
-	Metadata      map[string]any `json:"metadata"`
-	DownloadURL   *string        `json:"download_url"`
+	StorageProvider      string         `json:"storage_provider"`
+	StorageStatus        string         `json:"storage_status"`
+	StorageDestinationID *string        `json:"storage_destination_id"`
+	StorageDeliveryID    *string        `json:"storage_delivery_id"`
+	StagingExpiresAt     *string        `json:"staging_expires_at"`
+	StagingDeletedAt     *string        `json:"staging_deleted_at"`
+	ID                   string         `json:"id"`
+	Name                 string         `json:"name"`
+	Kind                 string         `json:"kind"`
+	MediaType            string         `json:"media_type"`
+	Format               string         `json:"format"`
+	ContentType          string         `json:"content_type"`
+	SizeBytes            int64          `json:"size_bytes"`
+	SHA256               string         `json:"sha256"`
+	ParentAssetID        *string        `json:"parent_asset_id"`
+	RequestID            string         `json:"request_id"`
+	WatermarkID          *string        `json:"watermark_id"`
+	CreatedAt            string         `json:"created_at"`
+	UpdatedAt            string         `json:"updated_at"`
+	FileExpiresAt        *string        `json:"file_expires_at"`
+	FileAvailable        bool           `json:"file_available"`
+	Version              int            `json:"version"`
+	Metadata             map[string]any `json:"metadata"`
+	DownloadURL          *string        `json:"download_url"`
 }
 type AssetPage struct {
 	Items      []Asset `json:"items"`

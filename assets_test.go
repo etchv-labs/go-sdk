@@ -65,7 +65,7 @@ func TestAssetProtocol(t *testing.T) {
 		t.Fatal(page, err)
 	}
 	a, err := c.GetAsset(ctx, record.ID)
-	if err != nil || a.Metadata["campaign"] != "launch" {
+	if err != nil || a.Metadata["campaign"] != "launch" || a.FileExpiresAt != nil || a.StorageProvider != "s3" {
 		t.Fatal(a, err)
 	}
 	a, err = c.UpdateAsset(ctx, record.ID, 1, map[string]any{"name": "renamed"})
