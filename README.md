@@ -5,7 +5,7 @@ Official server-side client for image, PDF and video watermarking. Go 1.25+. MIT
 ## Install
 
 ```sh
-go get github.com/etchv-labs/go-sdk@v0.2.0
+go get github.com/etchv-labs/go-sdk@v0.3.0
 ```
 
 ## Example
@@ -130,3 +130,19 @@ consume no credits. Downloads require authentication and return the original fil
 format. Single and bulk deletion methods are also available; batches contain at
 most 50 IDs and delete atomically. Deleting an output blocks its job result replay.
 See [the asset API](https://etchv.com/docs/api/assets) for the complete contract.
+
+## Async jobs and webhooks
+
+Submit a background job and receive a JSON receipt without polling automatically. Choose `images`, `documents`, or `videos`; every currently supported native format uses the same submission method.
+
+```go
+job, err := client.SubmitEmbed(ctx, "documents", pdfBytes,
+    map[string]any{"delivery": "delivery_001"},
+    etchv.Options{Filename: "document.pdf", IdempotencyKey: "delivery_001"}, webhookID)
+if err != nil { return err }
+status, err := client.GetJob(ctx, job["request_id"].(string), false)
+```
+
+Use the corresponding submission method for detection without forensic data. For detection status, set the status method’s `detect` argument to true. Existing embed/detect methods continue waiting for results.
+
+Create an endpoint in the [Etchv dashboard](https://etchv.com/dashboard/webhooks), then pass its ID when submitting. Persist your idempotency key before the upload so a lost receipt can be recovered safely. Download from the authenticated result URL after success, or use the existing result method. See the [async guide](https://etchv.com/docs/api/async) and [webhook verification guide](https://etchv.com/docs/api/webhooks).

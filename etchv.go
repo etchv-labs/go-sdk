@@ -134,7 +134,7 @@ func (c *Client) detect(ctx context.Context, media string, file []byte, opts Opt
 	}
 	return detection(b, h)
 }
-func (c *Client) post(ctx context.Context, media string, file, data []byte, opts Options) ([]byte, http.Header, error) {
+func (c *Client) post(ctx context.Context, media string, file, data []byte, opts Options, asyncWebhook ...string) ([]byte, http.Header, error) {
 	if len(file) == 0 || len(file) > MaxFileSize {
 		return nil, nil, fmt.Errorf("file must contain 1 byte to 20 MB")
 	}
@@ -161,7 +161,13 @@ func (c *Client) post(ctx context.Context, media string, file, data []byte, opts
 	if err = w.Close(); err != nil {
 		return nil, nil, err
 	}
-	durable := data != nil || media == "videos"
+	if len(asyncWebhook) > 0 {
+		path += "/async"
+		if asyncWebhook[0] != "" {
+			path += "?webhook_id=" + asyncWebhook[0]
+		}
+	}
+	durable := len(asyncWebhook) > 0 || data != nil || media == "videos"
 	if durable && opts.IdempotencyKey == "" {
 		var key [16]byte
 		if _, err = rand.Read(key[:]); err != nil {
@@ -218,7 +224,7 @@ func (c *Client) request(parent context.Context, path, method string, body []byt
 		if len(b) > MaxFileSize {
 			return nil, nil, &Error{res.StatusCode, "Response exceeds 20 MB", requestID, key}
 		}
-		if res.StatusCode == 200 || res.StatusCode == 204 {
+		if res.StatusCode == 200 || res.StatusCode == 204 || (res.StatusCode == 202 && strings.HasSuffix(strings.Split(path, "?")[0], "/async")) {
 			return b, res.Header, nil
 		}
 		var detail struct {
@@ -367,4 +373,50 @@ func extension(b []byte, mime string) string {
 		}
 	}
 	return ""
+}
+
+// SubmitEmbed accepts a durable job and returns its JSON receipt without polling.
+func (c *Client) SubmitEmbed(ctx context.Context, media string, file []byte, data map[string]any, opts Options, webhookID string) (map[string]any, error) {
+	if len(data) == 0 {
+		return nil, fmt.Errorf("data must be a non-empty JSON object")
+	}
+	encoded, err := json.Marshal(data)
+	if err != nil {
+		return nil, err
+	}
+	return c.submit(ctx, media, file, encoded, opts, webhookID)
+}
+func (c *Client) SubmitDetection(ctx context.Context, media string, file []byte, opts Options, webhookID string) (map[string]any, error) {
+	return c.submit(ctx, media, file, nil, opts, webhookID)
+}
+func (c *Client) submit(ctx context.Context, media string, file, data []byte, opts Options, webhookID string) (map[string]any, error) {
+	if media != "images" && media != "documents" && media != "videos" {
+		return nil, fmt.Errorf("invalid media type")
+	}
+	if webhookID != "" && !regexp.MustCompile(`^wh_[a-f0-9]{32}$`).MatchString(webhookID) {
+		return nil, fmt.Errorf("invalid webhook ID")
+	}
+	b, _, err := c.post(ctx, media, file, data, opts, webhookID)
+	if err != nil {
+		return nil, err
+	}
+	var job map[string]any
+	err = json.Unmarshal(b, &job)
+	return job, err
+}
+func (c *Client) GetJob(ctx context.Context, id string, detect bool) (map[string]any, error) {
+	if !jobID.MatchString(id) {
+		return nil, fmt.Errorf("invalid request ID")
+	}
+	prefix := "jobs"
+	if detect {
+		prefix = "detection-jobs"
+	}
+	b, _, err := c.request(ctx, "watermarks/"+prefix+"/"+id, "GET", nil, "", "", false, detect)
+	if err != nil {
+		return nil, err
+	}
+	var job map[string]any
+	err = json.Unmarshal(b, &job)
+	return job, err
 }
