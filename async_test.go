@@ -12,6 +12,9 @@ func TestAsyncReceipts(t *testing.T) {
 	calls := 0
 	webhook := "wh_" + strings.Repeat("a", 32)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.Path, "/detect/") && (r.URL.Query().Get("storage_destination_id") != "dst_"+strings.Repeat("c", 32) || r.URL.Query().Get("storage_key") != "a b/#file.pdf") {
+			t.Error("storage query was not preserved")
+		}
 		calls++
 		if r.Method != "POST" || !strings.HasSuffix(r.URL.Path, "/async") || r.URL.Query().Get("webhook_id") != webhook || r.Header.Get("Idempotency-Key") != "stable_test_key" {
 			t.Error("wrong submission request")
@@ -26,11 +29,13 @@ func TestAsyncReceipts(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, media := range []string{"images", "documents", "videos"} {
-		opts := Options{IdempotencyKey: "stable_test_key"}
+		opts := Options{IdempotencyKey: "stable_test_key", StorageDestinationID: "dst_" + strings.Repeat("c", 32), StorageKey: "a b/#file.pdf"}
 		job, err := client.SubmitEmbed(context.Background(), media, []byte("file"), map[string]any{"asset": "test"}, opts, webhook)
 		if err != nil || job["status"] != "queued" {
 			t.Fatalf("receipt: %v %v", job, err)
 		}
+		opts.StorageDestinationID = ""
+		opts.StorageKey = ""
 		job, err = client.SubmitDetection(context.Background(), media, []byte("file"), opts, webhook)
 		if err != nil || job["status"] != "queued" {
 			t.Fatalf("receipt: %v %v", job, err)

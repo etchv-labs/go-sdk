@@ -35,12 +35,14 @@ type Error struct {
 func (e *Error) Error() string { return fmt.Sprintf("Etchv request failed (HTTP %d)", e.StatusCode) }
 
 type Options struct {
-	Filename       string
-	IdempotencyKey string
+	StorageDestinationID string
+	StorageKey           string
+	Filename             string
+	IdempotencyKey       string
 }
 type EmbedResult struct {
-	Bytes                                                                 []byte
-	WatermarkID, RequestID, ContentType, Filename, AssetID, SourceAssetID string
+	Bytes                                                                                    []byte
+	WatermarkID, RequestID, ContentType, Filename, AssetID, SourceAssetID, StorageDeliveryID string
 }
 type DetectionUnit struct {
 	Index       int     `json:"index"`
@@ -167,6 +169,23 @@ func (c *Client) post(ctx context.Context, media string, file, data []byte, opts
 			path += "?webhook_id=" + asyncWebhook[0]
 		}
 	}
+	if opts.StorageKey != "" && opts.StorageDestinationID == "" {
+		return nil, nil, fmt.Errorf("storage key requires destination")
+	}
+	if opts.StorageDestinationID != "" {
+		if data == nil || !regexp.MustCompile(`^dst_[a-f0-9]{32}$`).MatchString(opts.StorageDestinationID) {
+			return nil, nil, fmt.Errorf("invalid storage destination or detection request")
+		}
+		q := url.Values{"storage_destination_id": {opts.StorageDestinationID}}
+		if opts.StorageKey != "" {
+			q.Set("storage_key", opts.StorageKey)
+		}
+		separator := "?"
+		if strings.Contains(path, "?") {
+			separator = "&"
+		}
+		path += separator + q.Encode()
+	}
 	durable := len(asyncWebhook) > 0 || data != nil || media == "videos"
 	if durable && opts.IdempotencyKey == "" {
 		var key [16]byte
@@ -273,7 +292,7 @@ func embedding(b []byte, h http.Header) (*EmbedResult, error) {
 	if m := safeFilename.FindStringSubmatch(h.Get("Content-Disposition")); m != nil {
 		filename = m[1]
 	}
-	return &EmbedResult{b, h.Get("X-Watermark-ID"), h.Get("X-Request-ID"), mime, filename, h.Get("X-Asset-ID"), h.Get("X-Source-Asset-ID")}, nil
+	return &EmbedResult{b, h.Get("X-Watermark-ID"), h.Get("X-Request-ID"), mime, filename, h.Get("X-Asset-ID"), h.Get("X-Source-Asset-ID"), h.Get("X-Storage-Delivery-ID")}, nil
 }
 func validDetection(raw json.RawMessage) bool {
 	var d struct {
@@ -419,4 +438,13 @@ func (c *Client) GetJob(ctx context.Context, id string, detect bool) (map[string
 	var job map[string]any
 	err = json.Unmarshal(b, &job)
 	return job, err
+}
+
+func (c *Client) GetStorageDelivery(ctx context.Context, id string) (map[string]any, error) {
+	if !regexp.MustCompile(`^std_[a-f0-9]{64}$`).MatchString(id) {
+		return nil, fmt.Errorf("invalid storage delivery ID")
+	}
+	var result map[string]any
+	err := c.assetJSON(ctx, "storage/deliveries/"+id, "GET", nil, &result)
+	return result, err
 }

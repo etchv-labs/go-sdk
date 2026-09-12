@@ -5,7 +5,7 @@ Official server-side client for image, PDF and video watermarking. Go 1.25+. MIT
 ## Install
 
 ```sh
-go get github.com/etchv-labs/go-sdk@v0.3.0
+go get github.com/etchv-labs/go-sdk@v0.4.0
 ```
 
 ## Example
@@ -146,3 +146,29 @@ status, err := client.GetJob(ctx, job["request_id"].(string), false)
 Use the corresponding submission method for detection without forensic data. For detection status, set the status method’s `detect` argument to true. Existing embed/detect methods continue waiting for results.
 
 Create an endpoint in the [Etchv dashboard](https://etchv.com/dashboard/webhooks), then pass its ID when submitting. Persist your idempotency key before the upload so a lost receipt can be recovered safely. Download from the authenticated result URL after success, or use the existing result method. See the [async guide](https://etchv.com/docs/api/async) and [webhook verification guide](https://etchv.com/docs/api/webhooks).
+
+## Customer-owned storage
+
+Version 0.4.0 adds storage destination and object-key options to image,
+PDF and video embedding, including asynchronous submission. Configure and verify
+a destination first in the dashboard.
+
+```go
+job, err := client.SubmitEmbed(ctx, "documents", pdfBytes,
+    map[string]any{"recipient": "customer-123"}, etchv.Options{
+        Filename: "report.pdf", IdempotencyKey: "report-export-001",
+        StorageDestinationID: destinationID, StorageKey: "reports/watermarked.pdf",
+    }, "")
+if err != nil { return err }
+// After the watermark job reports succeeded:
+delivery, err := client.GetStorageDelivery(ctx, job["storage_delivery_id"].(string))
+```
+
+The upload is queued after watermark verification, so its delivery record can
+initially return 404 while the watermark job is still processing. Wait for the
+watermark job to succeed before polling storage. Poll until `status` is `stored`,
+or handle a terminal failure. Upload retries do not watermark again or charge
+another credit. Binary embedding results include a storage delivery ID too.
+
+Use `storage:read` to inspect deliveries. Storage options do not apply to detection.
+See the [storage setup, retention and retry guide](https://etchv.com/docs/storage).
