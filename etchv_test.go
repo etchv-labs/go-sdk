@@ -106,6 +106,9 @@ func TestInputValidation(t *testing.T) {
 	if _, err := c.EmbedImage(context.Background(), nil, map[string]any{"a": 1}, Options{}); err == nil {
 		t.Fatal("empty file accepted")
 	}
+	if _, err := c.EmbedImage(context.Background(), make([]byte, MaxFileSize+1), map[string]any{"a": 1}, Options{}); err == nil || !strings.Contains(err.Error(), "50 MB") {
+		t.Fatal("oversized file accepted", err)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	if _, err := c.EmbedImage(ctx, []byte("x"), map[string]any{"a": 1}, Options{}); !errors.Is(err, context.Canceled) {

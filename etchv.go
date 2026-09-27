@@ -60,8 +60,12 @@ import (
 // Version is the SDK release version. It is sent in the User-Agent header.
 const Version = "1.0.0"
 
-// MaxFileSize is the largest upload or downloaded file the API accepts (20 MB).
-const MaxFileSize = 20 * 1024 * 1024
+// MaxFileSize is the largest upload the API accepts (50 MB). Images may use
+// all of it; the API rejects PDFs and videos over 20 MB with status 413.
+const MaxFileSize = 50 * 1024 * 1024
+
+// MaxDownloadSize is the largest response or result file the client reads (256 MB).
+const MaxDownloadSize = 256 * 1024 * 1024
 
 // DefaultBaseURL is the production API endpoint used by [New].
 const DefaultBaseURL = "https://api.etchv.com"
@@ -455,7 +459,7 @@ func (c *Client) upload(ctx context.Context, media Media, file, data []byte, opt
 		return nil, errors.New("etchv: invalid media type")
 	}
 	if len(file) == 0 || len(file) > MaxFileSize {
-		return nil, errors.New("etchv: file must contain 1 byte to 20 MB")
+		return nil, errors.New("etchv: file must contain 1 byte to 50 MB")
 	}
 	if opts.IdempotencyKey != "" && !idempotencyKey.MatchString(opts.IdempotencyKey) {
 		return nil, errors.New("etchv: idempotency key must contain 8–128 letters, digits, hyphens or underscores")
@@ -598,7 +602,7 @@ func (c *Client) do(parent context.Context, r call) (*response, error) {
 			pause(time.Second)
 			continue
 		}
-		b, err := io.ReadAll(io.LimitReader(res.Body, MaxFileSize+1))
+		b, err := io.ReadAll(io.LimitReader(res.Body, MaxDownloadSize+1))
 		res.Body.Close()
 		if id := res.Header.Get("X-Request-ID"); id != "" {
 			requestID = id
@@ -610,8 +614,8 @@ func (c *Client) do(parent context.Context, r call) (*response, error) {
 			pause(time.Second)
 			continue
 		}
-		if len(b) > MaxFileSize {
-			return nil, fail(res.StatusCode, "response exceeds 20 MB", nil)
+		if len(b) > MaxDownloadSize {
+			return nil, fail(res.StatusCode, "response exceeds 256 MB", nil)
 		}
 		if res.StatusCode >= 200 && res.StatusCode < 300 && !(res.StatusCode == 202 && r.poll != "") {
 			return &response{res.StatusCode, b, res.Header, r.idempotencyKey}, nil
