@@ -96,6 +96,30 @@ const (
 
 func (m Media) valid() bool { return m == MediaImages || m == MediaDocuments || m == MediaVideos }
 
+// Accelerator selects the hardware that processes a watermarking or detection
+// request. The zero value leaves the choice to the API (CPU).
+type Accelerator string
+
+// Supported accelerators.
+const (
+	// AcceleratorCPU processes the request on CPU (the default).
+	AcceleratorCPU Accelerator = "cpu"
+	// AcceleratorGPU requests GPU processing: Business plan or higher (HTTP 403
+	// otherwise), charged at 3× credits. When no GPU is ready the request runs
+	// on CPU at normal credits; results report the accelerator actually used.
+	AcceleratorGPU Accelerator = "gpu"
+)
+
+func (a Accelerator) valid() bool { return a == AcceleratorCPU || a == AcceleratorGPU }
+
+// accelerator returns a recognized accelerator value, or "" for anything else.
+func accelerator(value string) Accelerator {
+	if a := Accelerator(strings.ToLower(strings.TrimSpace(value))); a.valid() {
+		return a
+	}
+	return ""
+}
+
 // Error is returned for every failed API request and for client-side
 // transport failures or deadlines. Use [errors.As] to inspect it.
 //
@@ -117,6 +141,18 @@ type Error struct {
 	RequestID string
 	// IdempotencyKey is the key sent with a durable request, for recovery.
 	IdempotencyKey string
+	// Code is the machine-readable code from a structured error detail, such
+	// as "rate_limited" or "concurrency_limited" for HTTP 429.
+	Code string
+	// Message is the human-readable message from a structured error detail.
+	// When set, Error() reports it instead of Detail.
+	Message string
+	// Limit is the limit from a structured error detail, such as the request
+	// or concurrency limit for HTTP 429, or zero when absent.
+	Limit int
+	// RetryAfter is the wait the API requested with an HTTP 429 response
+	// (Retry-After), or zero when it sent none.
+	RetryAfter time.Duration
 
 	err error
 }
@@ -125,13 +161,17 @@ type Error struct {
 func (e *Error) Error() string {
 	var b strings.Builder
 	b.WriteString("etchv: ")
+	text := e.Detail
+	if e.Message != "" {
+		text = e.Message
+	}
 	if e.StatusCode != 0 {
 		fmt.Fprintf(&b, "HTTP %d", e.StatusCode)
-		if e.Detail != "" {
+		if text != "" {
 			b.WriteString(": ")
 		}
 	}
-	b.WriteString(e.Detail)
+	b.WriteString(text)
 	if e.err != nil {
 		b.WriteString(": ")
 		b.WriteString(e.err.Error())
@@ -165,6 +205,10 @@ type Options struct {
 	// StorageKey is an optional object key beneath the destination prefix.
 	// Requires StorageDestinationID.
 	StorageKey string
+	// Accelerator requests CPU or GPU processing; empty uses the API default
+	// (CPU). AcceleratorGPU requires a Business plan or higher and costs 3×
+	// credits; without a ready GPU the request runs on CPU at normal credits.
+	Accelerator Accelerator
 }
 
 // EmbedResult is a verified watermarked file in its original format.
@@ -185,6 +229,9 @@ type EmbedResult struct {
 	SourceAssetID string
 	// StorageDeliveryID identifies the customer storage delivery, if one was selected.
 	StorageDeliveryID string
+	// Accelerator is the hardware that actually processed the file ("cpu" or
+	// "gpu"), or empty when the API did not report it.
+	Accelerator Accelerator
 }
 
 // DetectionUnit is the detection result for one frame, page or composite.
@@ -203,6 +250,9 @@ type DetectionResult struct {
 	WatermarkID *string         `json:"watermark_id"`
 	Units       []DetectionUnit `json:"units"`
 	RequestID   string          `json:"-"`
+	// Accelerator is the hardware that actually processed the file ("cpu" or
+	// "gpu"), or empty when the API did not report it.
+	Accelerator Accelerator `json:"-"`
 }
 
 // Job is the receipt and status of a durable watermarking or detection job.
@@ -226,6 +276,12 @@ type Job struct {
 	StorageProvider      string  `json:"storage_provider"`
 	StorageDestinationID *string `json:"storage_destination_id"`
 	StorageDeliveryID    *string `json:"storage_delivery_id"`
+	// AcceleratorRequested is the accelerator requested at submission ("cpu"
+	// or "gpu").
+	AcceleratorRequested Accelerator `json:"accelerator_requested"`
+	// Accelerator is the hardware that processed (or is processing) the job;
+	// it differs from AcceleratorRequested after an automatic CPU fallback.
+	Accelerator Accelerator `json:"accelerator"`
 }
 
 // Done reports whether the job reached a terminal state.
@@ -489,6 +545,12 @@ func (c *Client) upload(ctx context.Context, media Media, file, data []byte, opt
 			q.Set("storage_key", opts.StorageKey)
 		}
 	}
+	if opts.Accelerator != "" {
+		if !opts.Accelerator.valid() {
+			return nil, errors.New(`etchv: accelerator must be "cpu" or "gpu"`)
+		}
+		q.Set("accelerator", string(opts.Accelerator))
+	}
 	if opts.Filename == "" {
 		opts.Filename = map[Media]string{MediaImages: "image.png", MediaDocuments: "document.pdf", MediaVideos: "video.mp4"}[media]
 	}
@@ -560,6 +622,24 @@ func retryDelay(h http.Header, fallback float64) time.Duration {
 		delay = math.Max(.01, math.Min(5, n))
 	}
 	return time.Duration(delay * float64(time.Second))
+}
+
+// retryAfter parses a Retry-After value (delta-seconds or HTTP date) into a
+// non-negative duration; it returns zero when the value is absent or invalid.
+func retryAfter(value string, now time.Time) time.Duration {
+	if value == "" {
+		return 0
+	}
+	if n, err := strconv.ParseFloat(value, 64); err == nil {
+		if math.IsNaN(n) || math.IsInf(n, 0) || n <= 0 || n > 1e9 {
+			return 0
+		}
+		return time.Duration(n * float64(time.Second))
+	}
+	if t, err := http.ParseTime(value); err == nil && t.After(now) {
+		return t.Sub(now)
+	}
+	return 0
 }
 
 func (c *Client) do(parent context.Context, r call) (*response, error) {
@@ -643,6 +723,17 @@ func (c *Client) do(parent context.Context, r call) (*response, error) {
 		}
 		e := fail(res.StatusCode, errorDetail(detail.Detail, b), nil)
 		e.JobStatus, e.ErrorCode = detail.Status, detail.ErrorCode
+		var structured struct {
+			Code    string  `json:"code"`
+			Message string  `json:"message"`
+			Limit   float64 `json:"limit"`
+		}
+		if json.Unmarshal(detail.Detail, &structured) == nil {
+			e.Code, e.Message, e.Limit = structured.Code, strings.ToValidUTF8(structured.Message, ""), int(structured.Limit)
+		}
+		if res.StatusCode == 429 {
+			e.RetryAfter = retryAfter(res.Header.Get("Retry-After"), time.Now())
+		}
 		if e.RequestID == "" && jobID.MatchString(detail.RequestID) {
 			e.RequestID = detail.RequestID
 		}
@@ -724,7 +815,7 @@ func embedding(b []byte, h http.Header) (*EmbedResult, error) {
 	if m := safeFilename.FindStringSubmatch(h.Get("Content-Disposition")); m != nil {
 		filename = m[1]
 	}
-	return &EmbedResult{b, h.Get("X-Watermark-ID"), h.Get("X-Request-ID"), contentType, filename, h.Get("X-Asset-ID"), h.Get("X-Source-Asset-ID"), h.Get("X-Storage-Delivery-ID")}, nil
+	return &EmbedResult{b, h.Get("X-Watermark-ID"), h.Get("X-Request-ID"), contentType, filename, h.Get("X-Asset-ID"), h.Get("X-Source-Asset-ID"), h.Get("X-Storage-Delivery-ID"), accelerator(h.Get("X-Etchv-Accelerator"))}, nil
 }
 
 func validDetection(raw json.RawMessage) bool {
@@ -771,6 +862,13 @@ func detection(b []byte, h http.Header) (*DetectionResult, error) {
 		d.Units = []DetectionUnit{{0, d.Watermarked, d.Confidence, d.WatermarkID}}
 	}
 	d.RequestID = h.Get("X-Request-ID")
+	d.Accelerator = accelerator(h.Get("X-Etchv-Accelerator"))
+	if d.Accelerator == "" {
+		var body string
+		if json.Unmarshal(raw["accelerator"], &body) == nil {
+			d.Accelerator = accelerator(body)
+		}
+	}
 	return &d, nil
 }
 

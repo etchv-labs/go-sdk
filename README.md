@@ -65,6 +65,23 @@ status, err := client.GetEmbedJob(ctx, job.RequestID) // or GetEmbedResult, whic
 Resending the same request with the same `Options.IdempotencyKey` returns the existing job without another charge.
 Detection uses `SubmitDetection`, `GetDetectionJob` and `GetDetectionResult`.
 
+## GPU processing
+
+```go
+result, err := client.EmbedVideo(ctx, video, data,
+	etchv.Options{Filename: "clip.mp4", Accelerator: etchv.AcceleratorGPU})
+fmt.Println(result.Accelerator) // "gpu", or "cpu" after an automatic fallback
+```
+
+`Options.Accelerator` (`AcceleratorCPU`, the default, or `AcceleratorGPU`) applies to every embed, detect and
+submit method. GPU processing requires a Business plan or higher (HTTP 403 otherwise) and costs 3× credits. When
+no GPU is ready the request runs on CPU at normal credits. `EmbedResult.Accelerator` and
+`DetectionResult.Accelerator` report the hardware that actually ran; `Job` has `AcceleratorRequested` and
+`Accelerator`.
+
+Embedding, video detection, submissions and result downloads retry HTTP 429 and 502–504 within the client
+timeout, honoring `Retry-After`; other calls return the `*etchv.Error`.
+
 ## Also included
 
 - API key check: `CheckAPIKey`
@@ -83,6 +100,9 @@ if errors.As(err, &apiErr) {
 	log.Printf("HTTP %d, request %s: %s", apiErr.StatusCode, apiErr.RequestID, apiErr.Detail)
 }
 ```
+
+Structured errors also set `Code`, `Message` (used as the error text) and `Limit`, for example
+`rate_limited` or `concurrency_limited` on HTTP 429. A 429 error's `RetryAfter` is the wait the API asked for (zero when it sent none).
 
 ## Links
 
