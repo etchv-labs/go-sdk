@@ -58,11 +58,24 @@ import (
 )
 
 // Version is the SDK release version. It is sent in the User-Agent header.
-const Version = "1.0.0"
+const Version = "1.1.0"
 
-// MaxFileSize is the largest upload the API accepts (50 MB). Images may use
+// MaxFileSize is the largest file the API watermarks (50 MB). Images may use
 // all of it; the API rejects PDFs and videos over 20 MB with status 413.
 const MaxFileSize = 50 * 1024 * 1024
+
+// MaxDetectFileSize is the largest file the API checks for a watermark
+// (192 MB): detection takes the files Etchv delivered, up to 192 MB for images,
+// 64 MB for PDFs and 100 MB for video.
+const MaxDetectFileSize = 192 * 1024 * 1024
+
+// DefaultLargeFileThreshold is the file size above which requests send the file
+// through an upload session (see [Client.UploadFile]) instead of the request body.
+const DefaultLargeFileThreshold = 40 * 1024 * 1024
+
+// syncDetectMaxSize is the largest image or PDF that synchronous detection
+// accepts; larger files are detected by a durable job.
+const syncDetectMaxSize = 95 * 1024 * 1024
 
 // MaxDownloadSize is the largest response or result file the client reads (256 MB).
 const MaxDownloadSize = 256 * 1024 * 1024
@@ -296,18 +309,20 @@ type APIKeyInfo struct {
 
 // Client calls the Etchv API. Create one with [New] and reuse it.
 type Client struct {
-	key, baseURL string
-	timeout      time.Duration
-	http         *http.Client
+	key, baseURL       string
+	timeout            time.Duration
+	http               *http.Client
+	largeFileThreshold int
 }
 
 // ClientOption configures a [Client] created by [New].
 type ClientOption func(*clientConfig)
 
 type clientConfig struct {
-	baseURL string
-	timeout time.Duration
-	http    *http.Client
+	baseURL            string
+	timeout            time.Duration
+	http               *http.Client
+	largeFileThreshold int
 }
 
 // WithBaseURL overrides the API base URL. It must use HTTPS; plain HTTP is
@@ -328,10 +343,17 @@ func WithHTTPClient(client *http.Client) ClientOption {
 	return func(c *clientConfig) { c.http = client }
 }
 
+// WithLargeFileThreshold sets the file size in bytes above which requests send
+// the file through an upload session instead of the request body (default
+// [DefaultLargeFileThreshold], 40 MB).
+func WithLargeFileThreshold(bytes int) ClientOption {
+	return func(c *clientConfig) { c.largeFileThreshold = bytes }
+}
+
 // New returns a client for the production API with a two-minute per-call
 // deadline, adjusted by any options.
 func New(apiKey string, opts ...ClientOption) (*Client, error) {
-	cfg := clientConfig{baseURL: DefaultBaseURL, timeout: DefaultTimeout}
+	cfg := clientConfig{baseURL: DefaultBaseURL, timeout: DefaultTimeout, largeFileThreshold: DefaultLargeFileThreshold}
 	for _, opt := range opts {
 		opt(&cfg)
 	}
@@ -346,13 +368,16 @@ func New(apiKey string, opts ...ClientOption) (*Client, error) {
 	if cfg.timeout <= 0 {
 		return nil, errors.New("etchv: timeout must be positive")
 	}
+	if cfg.largeFileThreshold <= 0 {
+		return nil, errors.New("etchv: large file threshold must be positive")
+	}
 	hc := &http.Client{}
 	if cfg.http != nil {
 		copied := *cfg.http
 		hc = &copied
 	}
 	hc.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-	return &Client{apiKey, strings.TrimRight(cfg.baseURL, "/"), cfg.timeout, hc}, nil
+	return &Client{apiKey, strings.TrimRight(cfg.baseURL, "/"), cfg.timeout, hc, cfg.largeFileThreshold}, nil
 }
 
 // CheckAPIKey validates the client's API key without consuming credits and
@@ -478,6 +503,14 @@ func (c *Client) embed(ctx context.Context, media Media, file []byte, data map[s
 }
 
 func (c *Client) detect(ctx context.Context, media Media, file []byte, opts Options) (*DetectionResult, error) {
+	if media != MediaVideos && len(file) > syncDetectMaxSize && len(file) <= MaxDetectFileSize && opts.WebhookID == "" {
+		// Synchronous image and PDF detection stops at 95 MB; larger delivered files run as a job.
+		job, err := c.submit(ctx, media, file, nil, opts)
+		if err != nil {
+			return nil, err
+		}
+		return c.GetDetectionResult(ctx, job.RequestID)
+	}
 	res, err := c.upload(ctx, media, file, nil, opts, false)
 	if err != nil {
 		return nil, err
@@ -514,8 +547,12 @@ func (c *Client) upload(ctx context.Context, media Media, file, data []byte, opt
 	if !media.valid() {
 		return nil, errors.New("etchv: invalid media type")
 	}
-	if len(file) == 0 || len(file) > MaxFileSize {
-		return nil, errors.New("etchv: file must contain 1 byte to 50 MB")
+	limit := MaxFileSize
+	if data == nil {
+		limit = MaxDetectFileSize
+	}
+	if len(file) == 0 || len(file) > limit {
+		return nil, fmt.Errorf("etchv: file must contain 1 byte to %d MB", limit/(1024*1024))
 	}
 	if opts.IdempotencyKey != "" && !idempotencyKey.MatchString(opts.IdempotencyKey) {
 		return nil, errors.New("etchv: idempotency key must contain 8–128 letters, digits, hyphens or underscores")
@@ -556,12 +593,28 @@ func (c *Client) upload(ctx context.Context, media Media, file, data []byte, opt
 	}
 	var body bytes.Buffer
 	w := multipart.NewWriter(&body)
-	part, err := w.CreateFormFile("file", opts.Filename)
-	if err != nil {
-		return nil, err
-	}
-	if _, err = part.Write(file); err != nil {
-		return nil, err
+	var err error
+	if len(file) > c.largeFileThreshold {
+		// Too large for one request body: upload once; every retry sends the same upload_id.
+		kind := map[Media]UploadKind{MediaImages: UploadImage, MediaDocuments: UploadDocument, MediaVideos: UploadVideo}[media]
+		if data == nil {
+			kind = UploadDetect
+		}
+		session, uploadErr := c.UploadFile(ctx, kind, file, opts.Filename)
+		if uploadErr != nil {
+			return nil, uploadErr
+		}
+		if err = w.WriteField("upload_id", session.UploadID); err != nil {
+			return nil, err
+		}
+	} else {
+		part, partErr := w.CreateFormFile("file", opts.Filename)
+		if partErr != nil {
+			return nil, partErr
+		}
+		if _, err = part.Write(file); err != nil {
+			return nil, err
+		}
 	}
 	path := "watermarks/" + string(media)
 	if data != nil {
@@ -595,6 +648,94 @@ func (c *Client) upload(ctx context.Context, media Media, file, data []byte, opt
 		}
 	}
 	return c.do(ctx, r)
+}
+
+// UploadKind selects what an upload session's file is for.
+type UploadKind string
+
+// Upload session kinds: a file to watermark by media, or any file to detect.
+const (
+	UploadImage    UploadKind = "image"
+	UploadDocument UploadKind = "document"
+	UploadVideo    UploadKind = "video"
+	UploadDetect   UploadKind = "detect"
+)
+
+// UploadSession is a file uploaded once to a signed URL. Send its UploadID as
+// the upload_id form field instead of the file.
+type UploadSession struct {
+	UploadID  string     `json:"upload_id"`
+	Kind      UploadKind `json:"kind"`
+	Filename  string     `json:"filename"`
+	Size      int        `json:"size"`
+	Status    string     `json:"status"`
+	ExpiresAt string     `json:"expires_at"`
+}
+
+// UploadFile uploads a file once to a signed URL and returns its session. The
+// embed, detect and submit methods do this automatically above the client's
+// large file threshold; retries reuse the same upload.
+func (c *Client) UploadFile(ctx context.Context, kind UploadKind, file []byte, filename string) (*UploadSession, error) {
+	if kind != UploadImage && kind != UploadDocument && kind != UploadVideo && kind != UploadDetect {
+		return nil, errors.New(`etchv: kind must be "image", "document", "video" or "detect"`)
+	}
+	if len(file) == 0 {
+		return nil, errors.New("etchv: file must contain at least 1 byte")
+	}
+	if filename == "" {
+		filename = "file"
+	}
+	var created struct {
+		UploadSession
+		Upload *struct {
+			Method string `json:"method"`
+			URL    string `json:"url"`
+		} `json:"upload"`
+	}
+	if err := c.json(ctx, "POST", "uploads", nil, map[string]any{"kind": kind, "filename": filename, "size": len(file)}, &created); err != nil {
+		return nil, err
+	}
+	if created.Upload == nil || created.Upload.Method != "PUT" || !strings.HasPrefix(created.Upload.URL, "https://") {
+		return nil, &Error{StatusCode: 201, Detail: "invalid upload session response"}
+	}
+	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+	for {
+		// The signed URL carries its own authorization: never send the API key there.
+		req, err := http.NewRequestWithContext(ctx, "PUT", created.Upload.URL, bytes.NewReader(file))
+		if err != nil {
+			return nil, &Error{Detail: "invalid upload URL", err: err}
+		}
+		req.Header.Set("Content-Type", "application/octet-stream")
+		req.Header.Set("User-Agent", "etchv-go/"+Version)
+		res, err := c.http.Do(req)
+		status := 0
+		var body []byte
+		if err == nil {
+			body, _ = io.ReadAll(io.LimitReader(res.Body, 2000))
+			res.Body.Close()
+			status = res.StatusCode
+		}
+		if status == 200 {
+			session := created.UploadSession
+			session.Status = "received"
+			return &session, nil
+		}
+		if err == nil && status != 500 && status != 502 && status != 503 && status != 504 {
+			detail := strings.ToValidUTF8(string(body), "")
+			if detail == "" {
+				detail = "upload refused"
+			}
+			return nil, &Error{StatusCode: status, Detail: detail}
+		}
+		t := time.NewTimer(time.Second)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return nil, &Error{Detail: "client deadline exceeded or context canceled during upload", err: ctx.Err()}
+		case <-t.C:
+		}
+	}
 }
 
 type call struct {

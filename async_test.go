@@ -249,3 +249,164 @@ func TestWebhooks(t *testing.T) {
 		}
 	}
 }
+
+const testUploadID = "upl_11111111111111111111111111111111"
+
+// uploadServer serves upload sessions and records each request as "METHOD path".
+func uploadServer(t *testing.T, handle func(w http.ResponseWriter, r *http.Request) bool) (*httptest.Server, *[]string) {
+	t.Helper()
+	calls := &[]string{}
+	var server *httptest.Server
+	server = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		*calls = append(*calls, r.Method+" "+r.URL.Path)
+		if handle(w, r) {
+			return
+		}
+		switch {
+		case r.URL.Path == "/uploads":
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			kind := body["kind"].(string)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(201)
+			_, _ = w.Write([]byte(`{"upload_id":"` + testUploadID + `","kind":"` + kind + `","filename":"f","size":` +
+				strconv.Itoa(int(body["size"].(float64))) + `,"status":"pending","expires_at":"x","upload":{"method":"PUT","url":"` +
+				server.URL + `/signed/` + kind + `?Signature=s","expires_at":"x"}}`))
+		case strings.HasPrefix(r.URL.Path, "/signed/"):
+			if r.Header.Get("X-API-Key") != "" {
+				t.Error("API key sent to the signed upload URL")
+			}
+			w.WriteHeader(200)
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	t.Cleanup(server.Close)
+	return server, calls
+}
+
+func uploadClient(t *testing.T, server *httptest.Server, threshold int) *Client {
+	t.Helper()
+	c, err := New("test-key", WithBaseURL(server.URL), WithHTTPClient(server.Client()), WithTimeout(10*time.Second), WithLargeFileThreshold(threshold))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
+func TestLargeEmbedUploadsOnceThenSendsTheUploadID(t *testing.T) {
+	file := []byte("\x89PNG\r\n\x1a\n" + strings.Repeat("x", 200))
+	server, calls := uploadServer(t, func(w http.ResponseWriter, r *http.Request) bool {
+		if r.URL.Path != "/watermarks/images" {
+			return false
+		}
+		if err := r.ParseMultipartForm(1 << 20); err != nil || r.FormValue("upload_id") != testUploadID || r.MultipartForm.File["file"] != nil {
+			t.Errorf("expected upload_id instead of a file: %v", err)
+		}
+		w.Header().Set("Content-Type", "image/png")
+		w.Header().Set("X-Watermark-ID", strings.Repeat("ab", 32))
+		_, _ = w.Write(file)
+		return true
+	})
+	result, err := uploadClient(t, server, 100).EmbedImage(context.Background(), file, map[string]any{"recipient": "test"}, Options{Filename: "photo.png"})
+	if err != nil || result.WatermarkID != strings.Repeat("ab", 32) {
+		t.Fatalf("embed: %v %v", result, err)
+	}
+	if strings.Join(*calls, ",") != "POST /uploads,PUT /signed/image,POST /watermarks/images" {
+		t.Fatalf("calls: %v", *calls)
+	}
+}
+
+func TestUploadRetriesResendTheSameUpload(t *testing.T) {
+	file := []byte("\x89PNG\r\n\x1a\n" + strings.Repeat("x", 200))
+	var posts []string
+	server, calls := uploadServer(t, func(w http.ResponseWriter, r *http.Request) bool {
+		if r.URL.Path != "/watermarks/images" {
+			return false
+		}
+		_ = r.ParseMultipartForm(1 << 20)
+		posts = append(posts, r.FormValue("upload_id"))
+		if len(posts) == 1 {
+			w.Header().Set("Retry-After", "0.01")
+			w.WriteHeader(503)
+			return true
+		}
+		w.Header().Set("Content-Type", "image/png")
+		w.Header().Set("X-Watermark-ID", strings.Repeat("ab", 32))
+		_, _ = w.Write(file)
+		return true
+	})
+	if _, err := uploadClient(t, server, 100).EmbedImage(context.Background(), file, map[string]any{"a": 1}, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	puts := 0
+	for _, call := range *calls {
+		if strings.HasPrefix(call, "PUT ") {
+			puts++
+		}
+	}
+	if puts != 1 || strings.Join(posts, ",") != testUploadID+","+testUploadID {
+		t.Fatalf("puts %d posts %v", puts, posts)
+	}
+}
+
+func TestLargeSyncImageDetectionRunsAsAJob(t *testing.T) {
+	requestID := "req_" + strings.Repeat("c", 64)
+	big := make([]byte, syncDetectMaxSize+1)
+	copy(big, "\x89PNG\r\n\x1a\n")
+	server, calls := uploadServer(t, func(w http.ResponseWriter, r *http.Request) bool {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/watermarks/images/detect/async":
+			w.WriteHeader(202)
+			_, _ = w.Write([]byte(`{"status":"queued","request_id":"` + requestID + `"}`))
+		case "/watermarks/detection-jobs/" + requestID + "/result":
+			_, _ = w.Write([]byte(`{"watermarked":true,"confidence":0.99,"watermark_id":"` + strings.Repeat("ab", 32) +
+				`","units":[{"index":0,"watermarked":true,"confidence":0.99,"watermark_id":"` + strings.Repeat("ab", 32) + `"}]}`))
+		default:
+			return false
+		}
+		return true
+	})
+	result, err := uploadClient(t, server, DefaultLargeFileThreshold).DetectImage(context.Background(), big, Options{})
+	if err != nil || !result.Watermarked {
+		t.Fatalf("detect: %v %v", result, err)
+	}
+	want := "POST /uploads,PUT /signed/detect,POST /watermarks/images/detect/async,GET /watermarks/detection-jobs/" + requestID + "/result"
+	if strings.Join(*calls, ",") != want {
+		t.Fatalf("calls: %v", *calls)
+	}
+}
+
+func TestLimitsFollowTheOperation(t *testing.T) {
+	c, _ := New("test-key")
+	ctx := context.Background()
+	if _, err := c.EmbedImage(ctx, make([]byte, MaxFileSize+1), map[string]any{"a": 1}, Options{}); err == nil || !strings.Contains(err.Error(), "50 MB") {
+		t.Fatalf("embed limit: %v", err)
+	}
+	if _, err := c.DetectImage(ctx, make([]byte, MaxDetectFileSize+1), Options{}); err == nil || !strings.Contains(err.Error(), "192 MB") {
+		t.Fatalf("detect limit: %v", err)
+	}
+	if _, err := c.UploadFile(ctx, "audio", []byte("x"), ""); err == nil {
+		t.Fatal("invalid kind accepted")
+	}
+	if _, err := New("test-key", WithLargeFileThreshold(0)); err == nil {
+		t.Fatal("zero threshold accepted")
+	}
+}
+
+func TestRefusedUploadReturnsItsStatus(t *testing.T) {
+	server, _ := uploadServer(t, func(w http.ResponseWriter, r *http.Request) bool {
+		if strings.HasPrefix(r.URL.Path, "/signed/") {
+			w.WriteHeader(403)
+			_, _ = w.Write([]byte("Forbidden"))
+			return true
+		}
+		return false
+	})
+	_, err := uploadClient(t, server, 100).UploadFile(context.Background(), UploadImage, []byte("abc"), "a.png")
+	var apiErr *Error
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != 403 {
+		t.Fatalf("expected 403 error, got %v", err)
+	}
+}
