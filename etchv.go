@@ -58,7 +58,7 @@ import (
 )
 
 // Version is the SDK release version. It is sent in the User-Agent header.
-const Version = "1.1.0"
+const Version = "1.2.0"
 
 // MaxFileSize is the largest file the API watermarks (50 MB). Images may use
 // all of it; the API rejects PDFs and videos over 20 MB with status 413.
@@ -698,41 +698,112 @@ func (c *Client) UploadFile(ctx context.Context, kind UploadKind, file []byte, f
 	if created.Upload == nil || created.Upload.Method != "PUT" || !strings.HasPrefix(created.Upload.URL, "https://") {
 		return nil, &Error{StatusCode: 201, Detail: "invalid upload session response"}
 	}
-	ctx, cancel := context.WithTimeout(ctx, c.timeout)
-	defer cancel()
+	err := c.putSigned(ctx, created.Upload.URL, int64(len(file)), func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(file)), nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	session := created.UploadSession
+	session.Status = "received"
+	return &session, nil
+}
+
+// errSizeChanged reports a file whose length differs from the size declared
+// for its upload; retrying cannot fix it.
+var errSizeChanged = errors.New("the file changed size after its upload was created")
+
+// idleReader resets an idle timer on every read and checks the declared size.
+type idleReader struct {
+	r       io.Reader
+	idle    *time.Timer
+	timeout time.Duration
+	want    int64
+	n       int64
+	changed bool
+}
+
+func (p *idleReader) Read(b []byte) (int, error) {
+	n, err := p.r.Read(b)
+	p.idle.Reset(p.timeout)
+	p.n += int64(n)
+	if p.want >= 0 && (p.n > p.want || (err == io.EOF && p.n != p.want)) {
+		p.changed = true
+		return n, errSizeChanged
+	}
+	return n, err
+}
+
+// putSigned uploads a file to a signed URL. Each attempt fails only after the
+// client timeout passes without progress (no body bytes read, or no response
+// after the last byte), so large files on slow links are not cut off. Transport
+// failures and HTTP 500 and 502–504 are retried for up to the client timeout
+// after the first failure. open is called for each attempt.
+func (c *Client) putSigned(ctx context.Context, signedURL string, size int64, open func() (io.ReadCloser, error)) error {
+	var firstFailure time.Time
 	for {
-		// The signed URL carries its own authorization: never send the API key there.
-		req, err := http.NewRequestWithContext(ctx, "PUT", created.Upload.URL, bytes.NewReader(file))
+		file, err := open()
 		if err != nil {
-			return nil, &Error{Detail: "invalid upload URL", err: err}
+			return &Error{Detail: "reading the file to upload failed", err: err}
 		}
+		attempt, cancel := context.WithCancel(ctx)
+		idle := time.AfterFunc(c.timeout, cancel)
+		body := &idleReader{r: file, idle: idle, timeout: c.timeout, want: size}
+		// The signed URL carries its own authorization: never send the API key there.
+		req, err := http.NewRequestWithContext(attempt, "PUT", signedURL, struct {
+			io.Reader
+			io.Closer
+		}{body, file})
+		if err != nil {
+			idle.Stop()
+			cancel()
+			file.Close()
+			return &Error{Detail: "invalid upload URL", err: err}
+		}
+		req.ContentLength = size
 		req.Header.Set("Content-Type", "application/octet-stream")
 		req.Header.Set("User-Agent", "etchv-go/"+Version)
 		res, err := c.http.Do(req)
 		status := 0
-		var body []byte
+		var detail []byte
 		if err == nil {
-			body, _ = io.ReadAll(io.LimitReader(res.Body, 2000))
+			detail, _ = io.ReadAll(io.LimitReader(res.Body, 2000))
 			res.Body.Close()
 			status = res.StatusCode
 		}
+		stalled := attempt.Err() != nil && ctx.Err() == nil
+		idle.Stop()
+		cancel()
 		if status == 200 {
-			session := created.UploadSession
-			session.Status = "received"
-			return &session, nil
+			return nil
+		}
+		if body.changed {
+			return &Error{Detail: "upload failed", err: errSizeChanged}
 		}
 		if err == nil && status != 500 && status != 502 && status != 503 && status != 504 {
-			detail := strings.ToValidUTF8(string(body), "")
-			if detail == "" {
-				detail = "upload refused"
+			text := strings.ToValidUTF8(string(detail), "")
+			if text == "" {
+				text = "upload refused"
 			}
-			return nil, &Error{StatusCode: status, Detail: detail}
+			return &Error{StatusCode: status, Detail: text}
+		}
+		if ctx.Err() != nil {
+			return &Error{Detail: "context canceled during upload", err: ctx.Err()}
+		}
+		if firstFailure.IsZero() {
+			firstFailure = time.Now()
+		}
+		if time.Since(firstFailure) >= c.timeout {
+			if stalled {
+				return &Error{StatusCode: status, Detail: fmt.Sprintf("upload stalled: no progress for %s", c.timeout), err: context.DeadlineExceeded}
+			}
+			return &Error{StatusCode: status, Detail: "upload failed after retries", err: err}
 		}
 		t := time.NewTimer(time.Second)
 		select {
 		case <-ctx.Done():
 			t.Stop()
-			return nil, &Error{Detail: "client deadline exceeded or context canceled during upload", err: ctx.Err()}
+			return &Error{Detail: "context canceled during upload", err: ctx.Err()}
 		case <-t.C:
 		}
 	}
@@ -746,6 +817,10 @@ type call struct {
 	idempotencyKey string
 	// retry retries transport failures and HTTP 429/502/503/504.
 	retry bool
+	// final503 returns HTTP 503 at once instead of retrying it.
+	final503 bool
+	// limit caps the response body; zero means MaxDownloadSize.
+	limit int
 	// poll follows HTTP 202 job continuations to this job collection's result.
 	poll string
 }
@@ -823,7 +898,11 @@ func (c *Client) do(parent context.Context, r call) (*response, error) {
 			pause(time.Second)
 			continue
 		}
-		b, err := io.ReadAll(io.LimitReader(res.Body, MaxDownloadSize+1))
+		limit := r.limit
+		if limit == 0 {
+			limit = MaxDownloadSize
+		}
+		b, err := io.ReadAll(io.LimitReader(res.Body, int64(limit)+1))
 		res.Body.Close()
 		if id := res.Header.Get("X-Request-ID"); id != "" {
 			requestID = id
@@ -835,8 +914,8 @@ func (c *Client) do(parent context.Context, r call) (*response, error) {
 			pause(time.Second)
 			continue
 		}
-		if len(b) > MaxDownloadSize {
-			return nil, fail(res.StatusCode, "response exceeds 256 MB", nil)
+		if len(b) > limit {
+			return nil, fail(res.StatusCode, fmt.Sprintf("response exceeds %d MB", limit/(1024*1024)), nil)
 		}
 		if res.StatusCode >= 200 && res.StatusCode < 300 && !(res.StatusCode == 202 && r.poll != "") {
 			return &response{res.StatusCode, b, res.Header, r.idempotencyKey}, nil
@@ -858,29 +937,41 @@ func (c *Client) do(parent context.Context, r call) (*response, error) {
 			pause(retryDelay(res.Header, 1))
 			continue
 		}
-		if r.retry && (res.StatusCode == 429 || res.StatusCode == 502 || res.StatusCode == 503 || res.StatusCode == 504) && detail.Status != "failed" {
+		if r.retry && (res.StatusCode == 429 || res.StatusCode == 502 || (res.StatusCode == 503 && !r.final503) || res.StatusCode == 504) && detail.Status != "failed" {
 			pause(retryDelay(res.Header, 1))
 			continue
 		}
-		e := fail(res.StatusCode, errorDetail(detail.Detail, b), nil)
-		e.JobStatus, e.ErrorCode = detail.Status, detail.ErrorCode
-		var structured struct {
-			Code    string  `json:"code"`
-			Message string  `json:"message"`
-			Limit   float64 `json:"limit"`
-		}
-		if json.Unmarshal(detail.Detail, &structured) == nil {
-			e.Code, e.Message, e.Limit = structured.Code, strings.ToValidUTF8(structured.Message, ""), int(structured.Limit)
-		}
-		if res.StatusCode == 429 {
-			e.RetryAfter = retryAfter(res.Header.Get("Retry-After"), time.Now())
-		}
-		if e.RequestID == "" && jobID.MatchString(detail.RequestID) {
-			e.RequestID = detail.RequestID
-		}
-		return nil, e
+		return nil, apiError(res.StatusCode, b, res.Header, requestID, r.idempotencyKey)
 	}
 	return nil, fail(0, "client deadline exceeded or context canceled; the job may still complete", ctx.Err())
+}
+
+// apiError builds the [*Error] for a failed API response body.
+func apiError(status int, b []byte, h http.Header, requestID, key string) *Error {
+	var detail struct {
+		Detail    json.RawMessage `json:"detail"`
+		RequestID string          `json:"request_id"`
+		Status    string          `json:"status"`
+		ErrorCode string          `json:"error_code"`
+	}
+	_ = json.Unmarshal(b, &detail)
+	e := &Error{StatusCode: status, Detail: errorDetail(detail.Detail, b), RequestID: requestID, IdempotencyKey: key}
+	e.JobStatus, e.ErrorCode = detail.Status, detail.ErrorCode
+	var structured struct {
+		Code    string  `json:"code"`
+		Message string  `json:"message"`
+		Limit   float64 `json:"limit"`
+	}
+	if json.Unmarshal(detail.Detail, &structured) == nil {
+		e.Code, e.Message, e.Limit = structured.Code, strings.ToValidUTF8(structured.Message, ""), int(structured.Limit)
+	}
+	if status == 429 {
+		e.RetryAfter = retryAfter(h.Get("Retry-After"), time.Now())
+	}
+	if e.RequestID == "" && jobID.MatchString(detail.RequestID) {
+		e.RequestID = detail.RequestID
+	}
+	return e
 }
 
 // errorDetail prefers the API's string detail and falls back to a bounded body.
