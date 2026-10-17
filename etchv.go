@@ -228,7 +228,7 @@ type Options struct {
 type EmbedResult struct {
 	// Bytes is the watermarked file; save it as-is.
 	Bytes []byte
-	// WatermarkID is the 64-character hexadecimal identifier embedded in the file.
+	// WatermarkID is the unique forensic watermark ID for this file, as 64 hexadecimal characters.
 	WatermarkID string
 	// RequestID identifies the job (req_…).
 	RequestID string
