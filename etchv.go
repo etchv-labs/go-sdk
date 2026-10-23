@@ -58,7 +58,7 @@ import (
 )
 
 // Version is the SDK release version. It is sent in the User-Agent header.
-const Version = "1.2.0"
+const Version = "1.3.0"
 
 // MaxFileSize is the largest file the API watermarks (50 MB). Images may use
 // all of it; the API rejects PDFs and videos over 20 MB with status 413.
@@ -253,6 +253,8 @@ type DetectionUnit struct {
 	Watermarked bool    `json:"watermarked"`
 	Confidence  float64 `json:"confidence"`
 	WatermarkID *string `json:"watermark_id"`
+	// Part is the package part that carries this unit (DOCX/PPTX only).
+	Part *string `json:"part,omitempty"`
 }
 
 // DetectionResult reports whether a file carries an Etchv watermark. A
@@ -397,12 +399,12 @@ func (c *Client) EmbedImage(ctx context.Context, file []byte, data map[string]an
 	return c.embed(ctx, MediaImages, file, data, opts)
 }
 
-// EmbedDocument watermarks a PDF and waits for the verified result.
+// EmbedDocument watermarks a PDF, DOCX or PPTX and waits for the verified result.
 func (c *Client) EmbedDocument(ctx context.Context, file []byte, data map[string]any, opts Options) (*EmbedResult, error) {
 	return c.embed(ctx, MediaDocuments, file, data, opts)
 }
 
-// EmbedVideo watermarks an MP4 or MOV video and waits for the verified result.
+// EmbedVideo watermarks an MP4, MOV, WebM, Matroska, MPEG or AVI video and waits for the verified result.
 func (c *Client) EmbedVideo(ctx context.Context, file []byte, data map[string]any, opts Options) (*EmbedResult, error) {
 	return c.embed(ctx, MediaVideos, file, data, opts)
 }
@@ -413,7 +415,7 @@ func (c *Client) DetectImage(ctx context.Context, file []byte, opts Options) (*D
 	return c.detect(ctx, MediaImages, file, opts)
 }
 
-// DetectDocument detects watermarks in a PDF, page by page. It is synchronous
+// DetectDocument detects watermarks in a PDF (page by page), DOCX or PPTX. It is synchronous
 // and is not retried automatically.
 func (c *Client) DetectDocument(ctx context.Context, file []byte, opts Options) (*DetectionResult, error) {
 	return c.detect(ctx, MediaDocuments, file, opts)
@@ -1091,7 +1093,7 @@ func detection(b []byte, h http.Header) (*DetectionResult, error) {
 			}
 		}
 	} else {
-		d.Units = []DetectionUnit{{0, d.Watermarked, d.Confidence, d.WatermarkID}}
+		d.Units = []DetectionUnit{{Index: 0, Watermarked: d.Watermarked, Confidence: d.Confidence, WatermarkID: d.WatermarkID}}
 	}
 	d.RequestID = h.Get("X-Request-ID")
 	d.Accelerator = accelerator(h.Get("X-Etchv-Accelerator"))
@@ -1154,6 +1156,33 @@ func extension(b []byte, contentType string) string {
 				return "mp4"
 			}
 			return "mov"
+		}
+	case "video/webm", "video/x-matroska":
+		if strings.HasPrefix(s, "\x1a\x45\xdf\xa3") {
+			if contentType == "video/webm" {
+				return "webm"
+			}
+			return "mkv"
+		}
+	case "video/mpeg":
+		if strings.HasPrefix(s, "\x00\x00\x01\xba") {
+			return "mpg"
+		}
+	case "video/mp2t":
+		if len(b) > 376 && b[0] == 0x47 && b[188] == 0x47 && b[376] == 0x47 {
+			return "ts"
+		}
+	case "video/x-msvideo":
+		if len(b) >= 12 && s[:4] == "RIFF" && s[8:12] == "AVI " {
+			return "avi"
+		}
+	case "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+		if strings.HasPrefix(s, "PK\x03\x04") {
+			return "docx"
+		}
+	case "application/vnd.openxmlformats-officedocument.presentationml.presentation":
+		if strings.HasPrefix(s, "PK\x03\x04") {
+			return "pptx"
 		}
 	}
 	return ""

@@ -47,6 +47,9 @@ func TestContract(t *testing.T) {
 		if err != nil || len(detected.Units) != 2 || !detected.Watermarked {
 			t.Fatalf("detection: %v", err)
 		}
+		if office := f.Extension == "docx" || f.Extension == "pptx"; office != (detected.Units[0].Part != nil) || office && *detected.Units[0].Part != "media/image1.png" {
+			t.Fatalf("detection part for %s", f.Extension)
+		}
 	}
 	for _, scenario := range []string{"retry", "embed-job", "detect-job", "failed", "redirect", "invalid", "bad-job", "bad-id", "bad-detection", "bad-units", "deadline"} {
 		ext := "png"

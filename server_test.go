@@ -138,6 +138,9 @@ func testServer(t *testing.T) (string, []fixture) {
 		}
 		if detection {
 			units := []map[string]any{{"index": 0, "watermarked": true, "confidence": .99, "watermark_id": id}, {"index": 1, "watermarked": true, "confidence": .99, "watermark_id": id}}
+			if ext == "docx" || ext == "pptx" {
+				units[0]["part"] = "media/image1.png"
+			}
 			result := map[string]any{"watermarked": true, "confidence": .99, "watermark_id": id, "units": units}
 			if scenario == "bad-detection" {
 				result["confidence"] = 1.5

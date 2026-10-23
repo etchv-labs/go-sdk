@@ -5,7 +5,7 @@ Server-side Go client for [Etchv](https://etchv.com): embed and detect invisible
 ## Install
 
 ```sh
-go get github.com/etchv-labs/go-sdk@v1.2.0
+go get github.com/etchv-labs/go-sdk@v1.3.0
 ```
 
 Requires Go 1.25+. The package name is `etchv`; the client is safe for concurrent use.
@@ -67,14 +67,14 @@ Detection uses `SubmitDetection`, `GetDetectionJob` and `GetDetectionResult`.
 
 ## Large files
 
-Image uploads are limited to 50 MB; PDF and video uploads to 20 MB. Detection
+Image uploads are limited to 50 MB; document and video uploads to 20 MB. Detection
 takes the files Etchv delivered: up to 192 MB for images, 64 MB for PDFs and
-100 MB for video.
+100 MB for DOCX, PPTX and video.
 
 Files over 40 MB are uploaded once to a signed URL and then referenced by ID,
 so the request never carries the file. This is automatic in every embed,
-detect and submit method; retries reuse the same upload. Image and PDF
-detection above 95 MB runs as a background job and the call waits for it.
+detect and submit method; retries reuse the same upload. Image and
+document detection above 95 MB runs as a background job and the call waits for it.
 Change the threshold with `etchv.WithLargeFileThreshold`, or upload explicitly:
 
 ```go
