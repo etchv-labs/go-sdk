@@ -72,6 +72,9 @@ type BatchOptions struct {
 	// StorageDestinationID delivers every result to a verified customer storage
 	// destination (dst_…). It cannot be combined with Archive.
 	StorageDestinationID string
+	// ActiveContent applies to every file, as in [Options]. With
+	// ActiveContentRemoveAutoRun every file must be a PDF (HTTP 422 otherwise).
+	ActiveContent ActiveContent
 	// IdempotencyKey makes the submission safely repeatable: 8–128 letters,
 	// digits, hyphens or underscores. One is generated when empty; persist your
 	// own to resume a batch across process restarts.
@@ -145,20 +148,23 @@ type Batch struct {
 	// Status is "draft", "starting", "processing", "assembling", or the final
 	// "completed" (at least one file succeeded), "failed", "cancelled" or
 	// "expired" (a draft never started within 24 hours).
-	Status               string       `json:"status"`
-	ItemCount            int          `json:"item_count"`
-	Archive              bool         `json:"archive"`
-	Accelerator          Accelerator  `json:"accelerator"`
-	WebhookID            *string      `json:"webhook_id"`
-	StorageDestinationID *string      `json:"storage_destination_id"`
-	Counts               BatchCounts  `json:"counts"`
-	Credits              BatchCredits `json:"credits"`
-	CancelRequested      bool         `json:"cancel_requested"`
-	CreatedAt            string       `json:"created_at"`
-	StartedAt            *string      `json:"started_at"`
-	CompletedAt          *string      `json:"completed_at"`
-	UploadExpiresAt      string       `json:"upload_expires_at"`
-	StatusURL            string       `json:"status_url"`
+	Status               string      `json:"status"`
+	ItemCount            int         `json:"item_count"`
+	Archive              bool        `json:"archive"`
+	Accelerator          Accelerator `json:"accelerator"`
+	WebhookID            *string     `json:"webhook_id"`
+	StorageDestinationID *string     `json:"storage_destination_id"`
+	// ActiveContent is the batch's choice for its PDFs' scripts and actions;
+	// empty when the API does not report one.
+	ActiveContent   ActiveContent `json:"active_content"`
+	Counts          BatchCounts   `json:"counts"`
+	Credits         BatchCredits  `json:"credits"`
+	CancelRequested bool          `json:"cancel_requested"`
+	CreatedAt       string        `json:"created_at"`
+	StartedAt       *string       `json:"started_at"`
+	CompletedAt     *string       `json:"completed_at"`
+	UploadExpiresAt string        `json:"upload_expires_at"`
+	StatusURL       string        `json:"status_url"`
 	// ArchiveStatus, ArchiveURL and ArchiveExpiresAt are set only with Archive.
 	ArchiveStatus    *string `json:"archive_status"`
 	ArchiveURL       *string `json:"archive_url"`
@@ -687,6 +693,9 @@ func batchOptions(opts *BatchOptions) (BatchOptions, error) {
 	if o.Accelerator != "" && !o.Accelerator.valid() {
 		return o, errors.New(`etchv: accelerator must be "cpu" or "gpu"`)
 	}
+	if o.ActiveContent != "" && !o.ActiveContent.valid() {
+		return o, errors.New(`etchv: active content must be "keep" or "remove_auto_run"`)
+	}
 	if o.UploadConcurrency < 0 {
 		return o, errors.New("etchv: upload concurrency must be at least 1")
 	}
@@ -715,6 +724,9 @@ func batchBody(o BatchOptions) map[string]any {
 	}
 	if o.StorageDestinationID != "" {
 		body["storage_destination_id"] = o.StorageDestinationID
+	}
+	if o.ActiveContent != "" {
+		body["active_content"] = o.ActiveContent
 	}
 	return body
 }

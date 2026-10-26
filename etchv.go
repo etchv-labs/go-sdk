@@ -58,15 +58,17 @@ import (
 )
 
 // Version is the SDK release version. It is sent in the User-Agent header.
-const Version = "1.3.0"
+const Version = "1.4.0"
 
-// MaxFileSize is the largest file the API watermarks (50 MB). Images may use
-// all of it; the API rejects PDFs and videos over 20 MB with status 413.
+// MaxFileSize is the largest file the API watermarks (50 MB). Images and PDFs
+// may use all of it; the API rejects DOCX, PPTX and videos over 20 MB with
+// status 413. A PDF has 1 to 2,000 pages, and its watermarked copy must fit in
+// 95 MB with 48 KB per page, so a 2,000-page PDF can be up to about 1 MB.
 const MaxFileSize = 50 * 1024 * 1024
 
 // MaxDetectFileSize is the largest file the API checks for a watermark
 // (192 MB): detection takes the files Etchv delivered, up to 192 MB for images,
-// 64 MB for PDFs and 100 MB for video.
+// 95 MB for PDFs and 100 MB for DOCX, PPTX and video.
 const MaxDetectFileSize = 192 * 1024 * 1024
 
 // DefaultLargeFileThreshold is the file size above which requests send the file
@@ -124,6 +126,24 @@ const (
 )
 
 func (a Accelerator) valid() bool { return a == AcceleratorCPU || a == AcceleratorGPU }
+
+// ActiveContent selects what PDF watermarking does with scripts and actions.
+// The zero value leaves the choice to the API (ActiveContentKeep).
+type ActiveContent string
+
+// Supported active content choices.
+const (
+	// ActiveContentKeep returns scripts, actions, form fields and attachments
+	// exactly as uploaded (the default).
+	ActiveContentKeep ActiveContent = "keep"
+	// ActiveContentRemoveAutoRun also removes what a PDF viewer runs by itself:
+	// the open action, document and page actions, document-level JavaScript and
+	// XFA forms. Links, form fields and attachments stay. PDFs only: the API
+	// refuses it for DOCX and PPTX with status 422.
+	ActiveContentRemoveAutoRun ActiveContent = "remove_auto_run"
+)
+
+func (a ActiveContent) valid() bool { return a == ActiveContentKeep || a == ActiveContentRemoveAutoRun }
 
 // accelerator returns a recognized accelerator value, or "" for anything else.
 func accelerator(value string) Accelerator {
@@ -222,6 +242,10 @@ type Options struct {
 	// (CPU). AcceleratorGPU requires a Business plan or higher and costs 3×
 	// credits; without a ready GPU the request runs on CPU at normal credits.
 	Accelerator Accelerator
+	// ActiveContent chooses what a watermarked PDF keeps of its scripts and
+	// actions; empty uses the API default (ActiveContentKeep). Only valid when
+	// embedding documents (EmbedDocument, or SubmitEmbed with MediaDocuments).
+	ActiveContent ActiveContent
 }
 
 // EmbedResult is a verified watermarked file in its original format.
@@ -589,6 +613,15 @@ func (c *Client) upload(ctx context.Context, media Media, file, data []byte, opt
 			return nil, errors.New(`etchv: accelerator must be "cpu" or "gpu"`)
 		}
 		q.Set("accelerator", string(opts.Accelerator))
+	}
+	if opts.ActiveContent != "" {
+		if !opts.ActiveContent.valid() {
+			return nil, errors.New(`etchv: active content must be "keep" or "remove_auto_run"`)
+		}
+		if data == nil || media != MediaDocuments {
+			return nil, errors.New("etchv: active content applies to PDF embedding only")
+		}
+		q.Set("active_content", string(opts.ActiveContent))
 	}
 	if opts.Filename == "" {
 		opts.Filename = map[Media]string{MediaImages: "image.png", MediaDocuments: "document.pdf", MediaVideos: "video.mp4"}[media]

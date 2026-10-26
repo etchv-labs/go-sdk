@@ -656,3 +656,53 @@ func TestArchiveOverTheCapIsRefusedBeforeReading(t *testing.T) {
 		t.Fatalf("cap: %v, calls %s", err, server.callList())
 	}
 }
+
+func TestBatchActiveContent(t *testing.T) {
+	var created, manifest map[string]any
+	var server *batchServer
+	server = newBatchServer(t, func(w http.ResponseWriter, r *http.Request, body []byte) bool {
+		view := batchView("starting")
+		view["active_content"] = "remove_auto_run"
+		switch r.Method + " " + r.URL.Path {
+		case "POST /watermarks/batches":
+			_ = json.Unmarshal(body, &created)
+			draft := batchView("draft", map[string]any{"index": 0, "filename": "a.pdf", "status": "pending",
+				"upload": map[string]any{"method": "PUT", "url": server.URL + "/signed/a.pdf?Signature=s", "expires_at": "x"}})
+			writeJSON(w, 201, draft)
+		case "POST /watermarks/batches/" + testBatchID + "/start":
+			writeJSON(w, 202, view)
+		case "POST /watermarks/batches/zip":
+			r.Body = io.NopCloser(strings.NewReader(string(body)))
+			if err := r.ParseMultipartForm(1 << 20); err != nil {
+				t.Fatal(err)
+			}
+			_ = json.Unmarshal([]byte(r.FormValue("manifest")), &manifest)
+			writeJSON(w, 202, view)
+		case "GET /watermarks/batches/" + testBatchID:
+			writeJSON(w, 200, batchView("completed"))
+		default:
+			return false
+		}
+		return true
+	})
+	c := server.client(t)
+	ctx := context.Background()
+	opts := &BatchOptions{ActiveContent: ActiveContentRemoveAutoRun}
+	started, err := c.SubmitBatch(ctx, []BatchItem{{Filename: "a.pdf", File: []byte("%PDF-1.7 a"), Data: map[string]any{"r": "a"}}}, opts)
+	if err != nil || started.ActiveContent != ActiveContentRemoveAutoRun || created["active_content"] != "remove_auto_run" {
+		t.Fatalf("batch: %+v %v body %v", started, err, created)
+	}
+	zipped, err := c.SubmitBatchZip(ctx, []byte("PK\x03\x04"), []BatchZipItem{{Filename: "a.pdf", Data: map[string]any{"r": "a"}}}, opts)
+	if err != nil || zipped.ActiveContent != ActiveContentRemoveAutoRun || manifest["active_content"] != "remove_auto_run" {
+		t.Fatalf("zip: %+v %v manifest %v", zipped, err, manifest)
+	}
+	// An API that does not report the option leaves it empty.
+	if read, err := c.GetBatch(ctx, testBatchID); err != nil || read.ActiveContent != "" {
+		t.Fatalf("get: %+v %v", read, err)
+	}
+	_, err = c.SubmitBatch(ctx, []BatchItem{{Filename: "a.pdf", File: []byte("%PDF"), Data: map[string]any{"r": "a"}}},
+		&BatchOptions{ActiveContent: "none"})
+	if err == nil || !strings.Contains(err.Error(), "active content") {
+		t.Fatalf("invalid value: %v", err)
+	}
+}

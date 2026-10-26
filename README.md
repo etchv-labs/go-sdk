@@ -5,7 +5,7 @@ Server-side Go client for [Etchv](https://etchv.com): embed and detect invisible
 ## Install
 
 ```sh
-go get github.com/etchv-labs/go-sdk@v1.3.0
+go get github.com/etchv-labs/go-sdk@v1.4.0
 ```
 
 Requires Go 1.25+. The package name is `etchv`; the client is safe for concurrent use.
@@ -67,9 +67,11 @@ Detection uses `SubmitDetection`, `GetDetectionJob` and `GetDetectionResult`.
 
 ## Large files
 
-Image uploads are limited to 50 MB; document and video uploads to 20 MB. Detection
-takes the files Etchv delivered: up to 192 MB for images, 64 MB for PDFs and
-100 MB for DOCX, PPTX and video.
+Image and PDF uploads are limited to 50 MB; DOCX, PPTX and video uploads to 20 MB.
+A PDF has 1 to 2,000 pages, and its watermarked copy must fit in 95 MB with 48 KB
+per page, so a 2,000-page PDF can be up to about 1 MB. Detection takes the files
+Etchv delivered: up to 192 MB for images, 95 MB for PDFs and 100 MB for DOCX,
+PPTX and video.
 
 Files over 40 MB are uploaded once to a signed URL and then referenced by ID,
 so the request never carries the file. This is automatic in every embed,
@@ -129,6 +131,22 @@ data arrives for the client timeout. `DownloadBatchArchive` returns the zip as b
 cannot exist is an error with `Code` `batch_not_started`, `archive_not_requested`, `archive_too_large` or
 `archive_unavailable`. Resubmitting a batch that expired before it started is an error; use a new key. Files already in one zip
 of up to 55 MB can go to `SubmitBatchZip` instead. `GetBatch`, `CancelBatch` and `ListBatches` cover the rest.
+`BatchOptions.Accelerator`, `StorageDestinationID` and `ActiveContent` apply to every file, as for single files.
+
+## PDF scripts and actions
+
+A watermarked PDF keeps its scripts, actions, form fields and attachments exactly as uploaded. Set
+`Options.ActiveContent` to `etchv.ActiveContentRemoveAutoRun` with `EmbedDocument` or `SubmitEmbed(ctx,
+etchv.MediaDocuments, ...)`, or `BatchOptions.ActiveContent`, to also remove what a PDF viewer runs by itself:
+the open action, document and page actions, document-level JavaScript and XFA forms. Links, form fields and
+attachments stay. `ActiveContentRemoveAutoRun` is for PDFs only: the API refuses it for a DOCX or PPTX, and for
+a batch unless every file is a PDF. Keeping active content is accepted for any document and any batch.
+[Scripts and actions](https://etchv.com/docs/api/documents#scripts-and-actions).
+
+```go
+result, err := client.EmbedDocument(ctx, pdf, data,
+	etchv.Options{Filename: "contract.pdf", ActiveContent: etchv.ActiveContentRemoveAutoRun})
+```
 
 ## GPU processing
 

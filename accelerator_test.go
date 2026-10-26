@@ -189,3 +189,73 @@ func TestRateLimitErrorDetails(t *testing.T) {
 		}
 	}
 }
+
+func TestActiveContent(t *testing.T) {
+	job := "req_" + strings.Repeat("b", 64)
+	pdf := []byte("%PDF-1.7 contract")
+	var mu sync.Mutex
+	var queries []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		queries = append(queries, r.URL.Path+"?"+r.URL.RawQuery)
+		mu.Unlock()
+		switch r.URL.Path {
+		case "/watermarks/documents":
+			w.Header().Set("Content-Type", "application/pdf")
+			w.Header().Set("X-Watermark-ID", strings.Repeat("a", 64))
+			_, _ = w.Write(pdf)
+		case "/watermarks/documents/async":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(202)
+			_, _ = w.Write([]byte(`{"request_id":"` + job + `","status":"queued"}`))
+		default:
+			t.Error("unexpected request", r.Method, r.URL.Path)
+			w.WriteHeader(404)
+		}
+	}))
+	defer server.Close()
+	c, _ := New("test-key", WithBaseURL(server.URL), WithTimeout(5*time.Second))
+	ctx := context.Background()
+	data := map[string]any{"recipient": "a"}
+
+	if _, err := c.EmbedDocument(ctx, pdf, data, Options{ActiveContent: ActiveContentRemoveAutoRun, Accelerator: AcceleratorGPU}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.SubmitEmbed(ctx, MediaDocuments, pdf, data, Options{ActiveContent: ActiveContentKeep}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.EmbedDocument(ctx, pdf, data, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	// Refused before any request: an unknown value, other media and detection.
+	refused := []func() error{
+		func() error { _, err := c.EmbedDocument(ctx, pdf, data, Options{ActiveContent: "strip"}); return err },
+		func() error {
+			_, err := c.EmbedImage(ctx, []byte("\x89PNG"), data, Options{ActiveContent: ActiveContentKeep})
+			return err
+		},
+		func() error {
+			_, err := c.SubmitEmbed(ctx, MediaVideos, []byte("video"), data, Options{ActiveContent: ActiveContentRemoveAutoRun})
+			return err
+		},
+		func() error {
+			_, err := c.DetectDocument(ctx, pdf, Options{ActiveContent: ActiveContentRemoveAutoRun})
+			return err
+		},
+	}
+	for i, call := range refused {
+		if err := call(); err == nil || !strings.Contains(err.Error(), "active content") {
+			t.Errorf("refusal %d: %v", i, err)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	want := []string{
+		"/watermarks/documents?accelerator=gpu&active_content=remove_auto_run",
+		"/watermarks/documents/async?active_content=keep",
+		"/watermarks/documents?",
+	}
+	if strings.Join(queries, ",") != strings.Join(want, ",") {
+		t.Fatalf("queries: %v", queries)
+	}
+}
