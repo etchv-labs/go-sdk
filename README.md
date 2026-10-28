@@ -5,7 +5,7 @@ Server-side Go client for [Etchv](https://etchv.com): embed and detect invisible
 ## Install
 
 ```sh
-go get github.com/etchv-labs/go-sdk@v1.4.0
+go get github.com/etchv-labs/go-sdk@v1.5.0
 ```
 
 Requires Go 1.25+. The package name is `etchv`; the client is safe for concurrent use.
@@ -162,8 +162,36 @@ no GPU is ready the request runs on CPU at normal credits. `EmbedResult.Accelera
 `DetectionResult.Accelerator` report the hardware that actually ran; `Job` has `AcceleratorRequested` and
 `Accelerator`.
 
-Embedding, video detection, submissions and result downloads retry HTTP 429 and 502–504 within the client
+Embedding, video detection, submissions, link creation and result downloads retry HTTP 429 and 502–504 within the client
 timeout, honoring `Retry-After`; other calls return the `*etchv.Error`.
+
+## Traceable links
+
+Share one file so each recipient downloads their own watermarked copy. Use the
+source asset of a file you've watermarked; send the returned `URL` yourself.
+
+```go
+link, err := client.CreateLink(ctx, etchv.LinkCreate{
+	AssetID:       result.SourceAssetID,
+	Name:          "Board pack, October",
+	Recipients:    []string{"alex@example.com", "sam@example.com"},
+	DownloadLimit: 3,
+})
+if err != nil {
+	log.Fatal(err)
+}
+fmt.Println(link.URL)
+```
+
+Set `AllowedDomains` instead of `Recipients` to let anyone at those domains
+open it. `EstimateLink` reports the credits the copies would take without
+creating anything. Also `GetLink` (each recipient, their opens and their
+copy), `ListLinks`, `ListLinkEvents` and `RevokeLink`.
+
+When a detected file is one of your links' copies, `DetectionResult.Copy` names
+the link, the recipient and when they first opened it (needs `links:read`);
+`DetectionResult.Asset` names any other watermarked asset of yours (needs
+`assets:read`). See https://etchv.com/docs/api/links.
 
 ## Also included
 

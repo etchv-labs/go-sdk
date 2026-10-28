@@ -58,7 +58,7 @@ import (
 )
 
 // Version is the SDK release version. It is sent in the User-Agent header.
-const Version = "1.4.0"
+const Version = "1.5.0"
 
 // MaxFileSize is the largest file the API watermarks (50 MB). Images and PDFs
 // may use all of it; the API rejects DOCX, PPTX and videos over 20 MB with
@@ -292,6 +292,12 @@ type DetectionResult struct {
 	// Accelerator is the hardware that actually processed the file ("cpu" or
 	// "gpu"), or empty when the API did not report it.
 	Accelerator Accelerator `json:"-"`
+	// Copy names the traceable link copy the watermark is on; nil when it
+	// isn't on one, or the key lacks links:read.
+	Copy *DetectedCopy `json:"copy"`
+	// Asset names another of your watermarked assets the watermark is on; nil
+	// when it isn't on one, or the key lacks assets:read.
+	Asset *DetectedAsset `json:"asset"`
 }
 
 // Job is the receipt and status of a durable watermarking or detection job.
@@ -1026,7 +1032,12 @@ func errorDetail(raw json.RawMessage, body []byte) string {
 
 // json sends an optional JSON body and decodes an optional JSON response.
 func (c *Client) json(ctx context.Context, method, path string, query url.Values, body, result any) error {
-	r := call{method: method, path: path, query: query}
+	return c.jsonCall(ctx, call{method: method, path: path, query: query}, body, result)
+}
+
+// jsonCall is json for a call that sets more than its method, path and query,
+// such as an idempotency key and retries.
+func (c *Client) jsonCall(ctx context.Context, r call, body, result any) error {
 	if body != nil {
 		b, err := json.Marshal(body)
 		if err != nil {
@@ -1039,7 +1050,7 @@ func (c *Client) json(ctx context.Context, method, path string, query url.Values
 		return err
 	}
 	if result != nil && json.Unmarshal(res.body, result) != nil {
-		return &Error{StatusCode: res.status, Detail: "invalid JSON response", RequestID: res.header.Get("X-Request-ID")}
+		return &Error{StatusCode: res.status, Detail: "invalid JSON response", RequestID: res.header.Get("X-Request-ID"), IdempotencyKey: r.idempotencyKey}
 	}
 	return nil
 }
