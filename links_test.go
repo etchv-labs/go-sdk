@@ -19,6 +19,7 @@ var (
 	testLink      = "lnk_" + strings.Repeat("a", 32)
 	testLinkEvent = "lev_" + strings.Repeat("b", 32)
 	testLinkHook  = "wh_" + strings.Repeat("c", 32)
+	testRecipient = "lrc_" + strings.Repeat("d", 32)
 )
 
 func linkServer(t *testing.T, handle func(w http.ResponseWriter, r *http.Request, body map[string]any)) *Client {
@@ -155,7 +156,7 @@ func TestLinkRoutes(t *testing.T) {
 		case "GET /links?before=" + testLink + "&limit=5":
 			_, _ = w.Write([]byte(`{"data":[{"id":"` + testLink + `"}],"next_cursor":"` + testLink + `"}`))
 		case "GET /links/" + testLink + "?":
-			_, _ = w.Write([]byte(`{"id":"` + testLink + `","recipients":[{"email":"alex@example.com","status":"opened","copy":{"status":"ready","asset_id":"` + testLinkAsset + `"}}]}`))
+			_, _ = w.Write([]byte(`{"id":"` + testLink + `","recipients":[{"id":"` + testRecipient + `","email":"alex@example.com","status":"opened","copy":{"status":"ready","asset_id":"` + testLinkAsset + `"}}]}`))
 		case "GET /links/" + testLink + "/events?before=" + testLinkEvent:
 			_, _ = w.Write([]byte(`{"data":[{"id":"` + testLinkEvent + `","type":"opened"}],"next_cursor":null}`))
 		case "POST /links/" + testLink + "/revoke?":
@@ -175,7 +176,7 @@ func TestLinkRoutes(t *testing.T) {
 		t.Fatal(page, err)
 	}
 	link, err := c.GetLink(ctx, testLink)
-	if err != nil || link.Recipients[0].Copy.Status != "ready" || *link.Recipients[0].Copy.AssetID != testLinkAsset {
+	if err != nil || link.Recipients[0].ID != testRecipient || link.Recipients[0].Copy.Status != "ready" || *link.Recipients[0].Copy.AssetID != testLinkAsset {
 		t.Fatal(link, err)
 	}
 	events, err := c.ListLinkEvents(ctx, testLink, 0, testLinkEvent)
@@ -184,6 +185,66 @@ func TestLinkRoutes(t *testing.T) {
 	}
 	if revoked, err := c.RevokeLink(ctx, testLink); err != nil || revoked.Status != "revoked" {
 		t.Fatal(revoked, err)
+	}
+}
+
+func TestDeleteLinkAndRemoveARecipient(t *testing.T) {
+	var routes []string
+	c := linkServer(t, func(w http.ResponseWriter, r *http.Request, body map[string]any) {
+		routes = append(routes, r.Method+" "+r.URL.Path)
+		switch r.Method + " " + r.URL.Path {
+		case "DELETE /links/" + testLink:
+			w.WriteHeader(204)
+		case "DELETE /links/" + testLink + "/recipients/" + testRecipient:
+			_, _ = w.Write([]byte(`{"id":"` + testLink + `","recipients":[]}`))
+		default:
+			w.WriteHeader(404)
+			_, _ = w.Write([]byte(`{"detail":"Link not found"}`))
+		}
+	})
+	ctx := context.Background()
+	if err := c.DeleteLink(ctx, testLink); err != nil {
+		t.Fatal(err)
+	}
+	link, err := c.RemoveLinkRecipient(ctx, testLink, testRecipient)
+	if err != nil || link.ID != testLink || len(link.Recipients) != 0 {
+		t.Fatal(link, err)
+	}
+	var apiErr *Error
+	other := "lrc_" + strings.Repeat("e", 32)
+	if _, err := c.RemoveLinkRecipient(ctx, testLink, other); !errors.As(err, &apiErr) || apiErr.StatusCode != 404 {
+		t.Fatal(err)
+	}
+	want := []string{"DELETE /links/" + testLink, "DELETE /links/" + testLink + "/recipients/" + testRecipient, "DELETE /links/" + testLink + "/recipients/" + other}
+	if !reflect.DeepEqual(routes, want) {
+		t.Fatal(routes)
+	}
+}
+
+func TestDeletesNeedAssetsDeleteAndValidIDs(t *testing.T) {
+	var calls int
+	c := linkServer(t, func(w http.ResponseWriter, r *http.Request, body map[string]any) {
+		calls++
+		w.WriteHeader(403)
+		_, _ = w.Write([]byte(`{"detail":"Deleting a link or recipient also needs the assets:delete scope"}`))
+	})
+	ctx := context.Background()
+	var apiErr *Error
+	if err := c.DeleteLink(ctx, testLink); !errors.As(err, &apiErr) || apiErr.StatusCode != 403 {
+		t.Fatal(err)
+	}
+	for _, err := range []error{
+		c.DeleteLink(ctx, "lnk_1"),
+		func() error { _, err := c.RemoveLinkRecipient(ctx, testLink, "lrc_1"); return err }(),
+		func() error { _, err := c.RemoveLinkRecipient(ctx, "lnk_1", testRecipient); return err }(),
+		func() error { _, err := c.RemoveLinkRecipient(ctx, testLink, testLink); return err }(),
+	} {
+		if err == nil {
+			t.Error("expected an error")
+		}
+	}
+	if calls != 1 {
+		t.Fatal("requests:", calls)
 	}
 }
 

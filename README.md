@@ -5,7 +5,7 @@ Server-side Go client for [Etchv](https://etchv.com): embed and detect invisible
 ## Install
 
 ```sh
-go get github.com/etchv-labs/go-sdk@v1.5.0
+go get github.com/etchv-labs/go-sdk@v1.6.0
 ```
 
 Requires Go 1.25+. The package name is `etchv`; the client is safe for concurrent use.
@@ -187,6 +187,12 @@ Set `AllowedDomains` instead of `Recipients` to let anyone at those domains
 open it. `EstimateLink` reports the credits the copies would take without
 creating anything. Also `GetLink` (each recipient, their opens and their
 copy), `ListLinks`, `ListLinkEvents` and `RevokeLink`.
+
+`DeleteLink(ctx, id)` deletes a link with every recipient's opens, downloads
+and copy; `RemoveLinkRecipient(ctx, id, recipient)` does the same for one
+recipient (their `ID` in `GetLink`) and returns the link without them. Neither
+can be undone, and detection no longer names a deleted recipient. Both need an
+owner or admin and, for an API key, `assets:delete` as well as `links:write`.
 
 When a detected file is one of your links' copies, `DetectionResult.Copy` names
 the link, the recipient and when they first opened it (needs `links:read`);

@@ -58,7 +58,7 @@ import (
 )
 
 // Version is the SDK release version. It is sent in the User-Agent header.
-const Version = "1.5.0"
+const Version = "1.6.0"
 
 // MaxFileSize is the largest file the API watermarks (50 MB). Images and PDFs
 // may use all of it; the API rejects DOCX, PPTX and videos over 20 MB with

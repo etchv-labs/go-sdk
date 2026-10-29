@@ -53,6 +53,8 @@ type LinkCopy struct {
 
 // LinkRecipient is one recipient of a link, with their opens and downloads.
 type LinkRecipient struct {
+	// ID ("lrc_…") is what [Client.RemoveLinkRecipient] takes.
+	ID    string `json:"id"`
 	Email string `json:"email"`
 	// Status is "not_opened" or "opened".
 	Status string `json:"status"`
@@ -157,6 +159,7 @@ type DetectedAsset struct {
 var (
 	linkID      = regexp.MustCompile(`^lnk_[a-f0-9]{32}$`)
 	linkEventID = regexp.MustCompile(`^lev_[a-f0-9]{32}$`)
+	recipientID = regexp.MustCompile(`^lrc_[a-f0-9]{32}$`)
 )
 
 func linkPath(id string) (string, error) {
@@ -302,6 +305,38 @@ func (c *Client) RevokeLink(ctx context.Context, id string) (*Link, error) {
 	}
 	var link Link
 	if err := c.json(ctx, "POST", path+"/revoke", nil, nil, &link); err != nil {
+		return nil, err
+	}
+	return &link, nil
+}
+
+// DeleteLink deletes a link with every recipient's opens, downloads and copy
+// (links:write and assets:delete, owner or admin). The link stops at once, as
+// on a revoke. This can't be undone, and detection no longer names the link's
+// recipients. Calling again also succeeds.
+func (c *Client) DeleteLink(ctx context.Context, id string) error {
+	path, err := linkPath(id)
+	if err != nil {
+		return err
+	}
+	return c.json(ctx, "DELETE", path, nil, nil, nil)
+}
+
+// RemoveLinkRecipient deletes one recipient's opens, downloads and copy, for
+// example when they ask to be erased, and returns the link without them
+// (links:write and assets:delete, owner or admin). This can't be undone, and
+// detection no longer names the recipient. recipient is the recipient's
+// [LinkRecipient.ID].
+func (c *Client) RemoveLinkRecipient(ctx context.Context, id, recipient string) (*Link, error) {
+	path, err := linkPath(id)
+	if err != nil {
+		return nil, err
+	}
+	if !recipientID.MatchString(recipient) {
+		return nil, errors.New("etchv: invalid recipient ID")
+	}
+	var link Link
+	if err := c.json(ctx, "DELETE", path+"/recipients/"+recipient, nil, nil, &link); err != nil {
 		return nil, err
 	}
 	return &link, nil
