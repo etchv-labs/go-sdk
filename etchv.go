@@ -58,7 +58,7 @@ import (
 )
 
 // Version is the SDK release version. It is sent in the User-Agent header.
-const Version = "1.6.0"
+const Version = "1.7.0"
 
 // MaxFileSize is the largest file the API watermarks (50 MB). Images and PDFs
 // may use all of it; the API rejects DOCX, PPTX and videos over 20 MB with
@@ -172,7 +172,7 @@ type Error struct {
 	ErrorCode string
 	// RequestID is the X-Request-ID of the failing request or job, if known.
 	RequestID string
-	// IdempotencyKey is the key sent with a durable request, for recovery.
+	// IdempotencyKey is the key sent with a durable request or a detection, for recovery.
 	IdempotencyKey string
 	// Code is the machine-readable code from a structured error detail, such
 	// as "rate_limited" or "concurrency_limited" for HTTP 429.
@@ -226,8 +226,9 @@ type Options struct {
 	// generic name for the media kind; send the real name when you have it.
 	Filename string
 	// IdempotencyKey makes a request safely repeatable: 8–128 letters, digits,
-	// hyphens or underscores. Durable operations generate one when empty;
-	// persist your own to recover across process restarts.
+	// hyphens or underscores. Durable operations and image and document
+	// detection generate one when empty; persist your own to recover across
+	// process restarts.
 	IdempotencyKey string
 	// WebhookID is an enabled webhook endpoint (wh_…) that receives the job's
 	// terminal event. Only valid with SubmitEmbed and SubmitDetection.
@@ -246,7 +247,20 @@ type Options struct {
 	// actions; empty uses the API default (ActiveContentKeep). Only valid when
 	// embedding documents (EmbedDocument, or SubmitEmbed with MediaDocuments).
 	ActiveContent ActiveContent
+	// KeepResult chooses whether the API keeps an instant detection's result
+	// for 24 hours, so a retry with the same IdempotencyKey gets it back; nil
+	// uses the API default (true). With false nothing is kept, and a retry runs
+	// detection again on the resent file at no charge (a file that went through
+	// an upload is uploaded again, bounded like any upload; the resend after it
+	// stays within the client timeout counted from the first send). Only valid
+	// with DetectImage and DetectDocument; detection that runs as a job keeps
+	// its result like any job. Set it with [Bool], for example
+	// Options{KeepResult: etchv.Bool(false)}.
+	KeepResult *bool
 }
+
+// Bool returns a pointer to v, for optional fields such as [Options.KeepResult].
+func Bool(v bool) *bool { return &v }
 
 // EmbedResult is a verified watermarked file in its original format.
 type EmbedResult struct {
@@ -439,14 +453,20 @@ func (c *Client) EmbedVideo(ctx context.Context, file []byte, data map[string]an
 	return c.embed(ctx, MediaVideos, file, data, opts)
 }
 
-// DetectImage detects a watermark in an image. Image detection is synchronous
-// and is not retried automatically.
+// DetectImage detects a watermark in an image. A dropped connection is sent
+// again with the same idempotency key (generated when empty) until the client
+// timeout, and so is a retry the API reports as still running (HTTP 409 with
+// Code "request_in_progress", or "upload_in_use" while the first copy holds
+// the file's upload); the API returns the first result without charging
+// again. No error status is retried: HTTP 409 with Code "replay_expired" or
+// "request_failed" needs a new key. Every [*Error] carries the IdempotencyKey,
+// and has StatusCode 0 when time runs out. See [Options.KeepResult].
 func (c *Client) DetectImage(ctx context.Context, file []byte, opts Options) (*DetectionResult, error) {
 	return c.detect(ctx, MediaImages, file, opts)
 }
 
-// DetectDocument detects watermarks in a PDF (page by page), DOCX or PPTX. It is synchronous
-// and is not retried automatically.
+// DetectDocument detects watermarks in a PDF (page by page), DOCX or PPTX. It
+// is retried like [Client.DetectImage].
 func (c *Client) DetectDocument(ctx context.Context, file []byte, opts Options) (*DetectionResult, error) {
 	return c.detect(ctx, MediaDocuments, file, opts)
 }
@@ -536,7 +556,9 @@ func (c *Client) embed(ctx context.Context, media Media, file []byte, data map[s
 
 func (c *Client) detect(ctx context.Context, media Media, file []byte, opts Options) (*DetectionResult, error) {
 	if media != MediaVideos && len(file) > syncDetectMaxSize && len(file) <= MaxDetectFileSize && opts.WebhookID == "" {
-		// Synchronous image and PDF detection stops at 95 MB; larger delivered files run as a job.
+		// Synchronous image and PDF detection stops at 95 MB; larger delivered files run as a job,
+		// which keeps its result like any job.
+		opts.KeepResult = nil
 		job, err := c.submit(ctx, media, file, nil, opts)
 		if err != nil {
 			return nil, err
@@ -629,66 +651,96 @@ func (c *Client) upload(ctx context.Context, media Media, file, data []byte, opt
 		}
 		q.Set("active_content", string(opts.ActiveContent))
 	}
+	// Embedding, video detection and all async submissions are durable jobs:
+	// they are safe to retry with a stable idempotency key. Image and document
+	// detection answered in the request is replayed for the same key, so it is
+	// resent after a dropped connection.
+	durable := async || data != nil || media == MediaVideos
+	if opts.KeepResult != nil {
+		if durable {
+			return nil, errors.New("etchv: KeepResult applies to DetectImage and DetectDocument only")
+		}
+		q.Set("keep_result", strconv.FormatBool(*opts.KeepResult))
+	}
 	if opts.Filename == "" {
 		opts.Filename = map[Media]string{MediaImages: "image.png", MediaDocuments: "document.pdf", MediaVideos: "video.mp4"}[media]
 	}
-	var body bytes.Buffer
-	w := multipart.NewWriter(&body)
-	var err error
-	if len(file) > c.largeFileThreshold {
-		// Too large for one request body: upload once; every retry sends the same upload_id.
-		kind := map[Media]UploadKind{MediaImages: UploadImage, MediaDocuments: UploadDocument, MediaVideos: UploadVideo}[media]
-		if data == nil {
-			kind = UploadDetect
-		}
-		session, uploadErr := c.UploadFile(ctx, kind, file, opts.Filename)
-		if uploadErr != nil {
-			return nil, uploadErr
-		}
-		if err = w.WriteField("upload_id", session.UploadID); err != nil {
-			return nil, err
-		}
-	} else {
-		part, partErr := w.CreateFormFile("file", opts.Filename)
-		if partErr != nil {
-			return nil, partErr
-		}
-		if _, err = part.Write(file); err != nil {
-			return nil, err
-		}
-	}
-	path := "watermarks/" + string(media)
-	if data != nil {
-		if err = w.WriteField("data", string(data)); err != nil {
-			return nil, err
-		}
-	} else {
-		path += "/detect"
-	}
-	if err = w.Close(); err != nil {
-		return nil, err
-	}
-	if async {
-		path += "/async"
-	}
-	// Embedding, video detection and all async submissions are durable jobs:
-	// they are safe to retry with a stable idempotency key.
-	durable := async || data != nil || media == MediaVideos
-	if durable && opts.IdempotencyKey == "" {
+	if opts.IdempotencyKey == "" {
 		var key [16]byte
-		if _, err = rand.Read(key[:]); err != nil {
+		if _, err := rand.Read(key[:]); err != nil {
 			return nil, err
 		}
 		opts.IdempotencyKey = hex.EncodeToString(key[:])
 	}
-	r := call{method: "POST", path: path, query: q, body: body.Bytes(), contentType: w.FormDataContentType(), idempotencyKey: opts.IdempotencyKey, retry: durable}
-	if durable && !async {
-		r.poll = "jobs"
-		if data == nil {
-			r.poll = "detection-jobs"
-		}
+	path := "watermarks/" + string(media)
+	if data == nil {
+		path += "/detect"
 	}
-	return c.do(ctx, r)
+	if async {
+		path += "/async"
+	}
+	uploaded := len(file) > c.largeFileThreshold
+	// Every send shares the deadline set when the first one starts, after its upload.
+	var deadline time.Time
+	send := func() (*response, error) {
+		var body bytes.Buffer
+		w := multipart.NewWriter(&body)
+		if uploaded {
+			// Too large for one request body: upload once; every retry sends the same upload_id.
+			kind := map[Media]UploadKind{MediaImages: UploadImage, MediaDocuments: UploadDocument, MediaVideos: UploadVideo}[media]
+			if data == nil {
+				kind = UploadDetect
+			}
+			session, err := c.UploadFile(ctx, kind, file, opts.Filename)
+			if err != nil {
+				return nil, err
+			}
+			if err = w.WriteField("upload_id", session.UploadID); err != nil {
+				return nil, err
+			}
+		} else {
+			part, err := w.CreateFormFile("file", opts.Filename)
+			if err != nil {
+				return nil, err
+			}
+			if _, err = part.Write(file); err != nil {
+				return nil, err
+			}
+		}
+		if data != nil {
+			if err := w.WriteField("data", string(data)); err != nil {
+				return nil, err
+			}
+		}
+		if err := w.Close(); err != nil {
+			return nil, err
+		}
+		if deadline.IsZero() {
+			deadline = time.Now().Add(c.timeout)
+		}
+		r := call{method: "POST", path: path, query: q, body: body.Bytes(), contentType: w.FormDataContentType(), idempotencyKey: opts.IdempotencyKey,
+			retry: durable, resend: !durable, upload: uploaded, deadline: deadline}
+		if durable && !async {
+			r.poll = "jobs"
+			if data == nil {
+				r.poll = "detection-jobs"
+			}
+		}
+		return c.do(ctx, r)
+	}
+	res, err := send()
+	var apiErr *Error
+	if !durable && uploaded && errors.As(err, &apiErr) && apiErr.StatusCode == 409 && apiErr.Code == "upload_consumed" {
+		// A dropped detection consumed the upload and kept no result (KeepResult false): the API
+		// runs it again on the same bytes, so upload them again and resend with the same key,
+		// within the first send's deadline.
+		res, err = send()
+	}
+	if errors.As(err, &apiErr) && apiErr.IdempotencyKey == "" {
+		// An upload failure too: the caller resends with this key, never charged twice.
+		apiErr.IdempotencyKey = opts.IdempotencyKey
+	}
+	return res, err
 }
 
 // UploadKind selects what an upload session's file is for.
@@ -858,6 +910,16 @@ type call struct {
 	idempotencyKey string
 	// retry retries transport failures and HTTP 429/502/503/504.
 	retry bool
+	// resend is for a request the API answers the same way twice (a GET
+	// download, or an instant detection with its Idempotency-Key): it is sent
+	// again after a transport failure and while the API reports the first copy
+	// still running (HTTP 409 request_in_progress), but no error status is retried.
+	resend bool
+	// upload marks a body naming an upload this call created: with resend, HTTP
+	// 409 upload_in_use (the first copy still holds it) is waited out too.
+	upload bool
+	// deadline, when set, replaces the client timeout from now.
+	deadline time.Time
 	// final503 returns HTTP 503 at once instead of retrying it.
 	final503 bool
 	// limit caps the response body; zero means MaxDownloadSize.
@@ -900,8 +962,15 @@ func retryAfter(value string, now time.Time) time.Duration {
 }
 
 func (c *Client) do(parent context.Context, r call) (*response, error) {
-	ctx, cancel := context.WithTimeout(parent, c.timeout)
+	deadline := r.deadline
+	if deadline.IsZero() {
+		deadline = time.Now().Add(c.timeout)
+	}
+	ctx, cancel := context.WithDeadline(parent, deadline)
 	defer cancel()
+	// dropped is the last transport failure of a keyless resend (a download),
+	// returned instead of the deadline error when time runs out after it.
+	var dropped error
 	requestID := ""
 	fail := func(status int, detail string, cause error) *Error {
 		return &Error{StatusCode: status, Detail: detail, RequestID: requestID, IdempotencyKey: r.idempotencyKey, err: cause}
@@ -933,12 +1002,14 @@ func (c *Client) do(parent context.Context, r call) (*response, error) {
 		}
 		res, err := c.http.Do(req)
 		if err != nil {
-			if !r.retry || ctx.Err() != nil {
+			if !c.resendable(ctx, r) {
 				return nil, fail(0, "request failed", err)
 			}
+			dropped = keyless(r, err)
 			pause(time.Second)
 			continue
 		}
+		dropped = nil
 		limit := r.limit
 		if limit == 0 {
 			limit = MaxDownloadSize
@@ -949,9 +1020,10 @@ func (c *Client) do(parent context.Context, r call) (*response, error) {
 			requestID = id
 		}
 		if err != nil {
-			if !r.retry || ctx.Err() != nil {
+			if !c.resendable(ctx, r) {
 				return nil, fail(0, "reading response failed", err)
 			}
+			dropped = keyless(r, err)
 			pause(time.Second)
 			continue
 		}
@@ -978,13 +1050,46 @@ func (c *Client) do(parent context.Context, r call) (*response, error) {
 			pause(retryDelay(res.Header, 1))
 			continue
 		}
+		if r.resend && res.StatusCode == 409 {
+			var structured struct {
+				Code string `json:"code"`
+			}
+			if json.Unmarshal(detail.Detail, &structured) == nil &&
+				(structured.Code == "request_in_progress" || (r.upload && structured.Code == "upload_in_use")) {
+				pause(retryDelay(res.Header, 1))
+				continue
+			}
+		}
 		if r.retry && (res.StatusCode == 429 || res.StatusCode == 502 || (res.StatusCode == 503 && !r.final503) || res.StatusCode == 504) && detail.Status != "failed" {
 			pause(retryDelay(res.Header, 1))
 			continue
 		}
 		return nil, apiError(res.StatusCode, b, res.Header, requestID, r.idempotencyKey)
 	}
+	if dropped != nil && parent.Err() == nil {
+		return nil, fail(0, "request failed", dropped)
+	}
 	return nil, fail(0, "client deadline exceeded or context canceled; the job may still complete", ctx.Err())
+}
+
+// keyless returns err when r is a resend without an idempotency key (a
+// download), whose transport failure is the error to report, and nil otherwise.
+func keyless(r call, err error) error {
+	if r.retry || r.idempotencyKey != "" {
+		return nil
+	}
+	return err
+}
+
+// resendable reports whether r may be sent again after a transport failure.
+// A download with under a second left returns the failure itself; a keyed
+// request ends with the deadline error and its idempotency key.
+func (c *Client) resendable(ctx context.Context, r call) bool {
+	if (!r.retry && !r.resend) || ctx.Err() != nil {
+		return false
+	}
+	deadline, _ := ctx.Deadline()
+	return r.retry || r.idempotencyKey != "" || time.Until(deadline) > time.Second
 }
 
 // apiError builds the [*Error] for a failed API response body.
@@ -1068,8 +1173,10 @@ type Download struct {
 	AssetID string
 }
 
+// download GETs a file, sending the request again after a dropped connection
+// within the client timeout.
 func (c *Client) download(ctx context.Context, path string) (*Download, error) {
-	res, err := c.do(ctx, call{method: "GET", path: path})
+	res, err := c.do(ctx, call{method: "GET", path: path, resend: true})
 	if err != nil {
 		return nil, err
 	}

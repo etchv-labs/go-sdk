@@ -5,7 +5,7 @@ Server-side Go client for [Etchv](https://etchv.com): embed and detect invisible
 ## Install
 
 ```sh
-go get github.com/etchv-labs/go-sdk@v1.6.0
+go get github.com/etchv-labs/go-sdk@v1.7.0
 ```
 
 Requires Go 1.25+. The package name is `etchv`; the client is safe for concurrent use.
@@ -127,7 +127,8 @@ returns the same batch and uploads only what it has not received. Files that are
 Upload URLs last 6 hours and a batch must start within 24 hours; results and the archive (with `Archive: true`,
 up to 1 GB) stay available for 24 hours. `WaitForBatch`, `BatchResults` and the archive downloads wait up to their
 timeout (one hour when zero), honoring `Retry-After` between polls; the archive download itself only fails when no
-data arrives for the client timeout. `DownloadBatchArchive` returns the zip as bytes instead, and an archive that
+data arrives for the client timeout. If the connection drops mid-download, the download starts again from the
+beginning: a `*bytes.Buffer` or an `*os.File` is truncated back first, and any other writer gets the error instead. `DownloadBatchArchive` returns the zip as bytes instead, and an archive that
 cannot exist is an error with `Code` `batch_not_started`, `archive_not_requested`, `archive_too_large` or
 `archive_unavailable`. Resubmitting a batch that expired before it started is an error; use a new key. Files already in one zip
 of up to 55 MB can go to `SubmitBatchZip` instead. `GetBatch`, `CancelBatch` and `ListBatches` cover the rest.
@@ -164,6 +165,21 @@ no GPU is ready the request runs on CPU at normal credits. `EmbedResult.Accelera
 
 Embedding, video detection, submissions, link creation and result downloads retry HTTP 429 and 502–504 within the client
 timeout, honoring `Retry-After`; other calls return the `*etchv.Error`.
+
+These methods also retry a dropped connection within the client timeout: the embed methods, `DetectVideo`,
+`SubmitEmbed`, `SubmitDetection`, `GetEmbedResult`, `GetDetectionResult`, `SubmitBatch`, `SubmitBatchZip`, `GetBatch`,
+`WaitForBatch`, `CancelBatch`, `CreateLink`, `DetectImage`, `DetectDocument`, `DownloadAsset`,
+`DownloadStorageDelivery`, `DownloadBatchArchive` and `DownloadBatchArchiveTo`. Other methods return the network error.
+
+`DetectImage` and `DetectDocument` resend with the same `Options.IdempotencyKey` (generated when empty), and the API
+returns the first result without charging again. A retry the API reports as still running (HTTP 409
+`request_in_progress`, or `upload_in_use` for a file sent through an upload) waits and is sent again; 409
+`replay_expired` or `request_failed` needs a new key. The API keeps the result 24 hours for this; set
+`Options.KeepResult` to `etchv.Bool(false)` to keep nothing, and a retry then runs detection again at no charge, after
+the SDK uploads the file again if it went through an upload. The detection requests, resends included, stay within
+one client timeout counted from the first send; uploading the file again is bounded like any upload. Errors
+from a keyed call carry its `IdempotencyKey`, so you can resend it yourself. A batch archive starts again from the
+beginning.
 
 ## Traceable links
 

@@ -537,6 +537,13 @@ func (c *Client) DownloadBatchArchive(ctx context.Context, id string, timeout ti
 // data arrives for the client timeout, however long the whole zip takes.
 // Nothing is written to w unless the archive is ready.
 //
+// When the connection drops or stalls mid-download, the download starts again
+// from the beginning until timeout passes (the archive route does not resume),
+// after taking back what was written: a *bytes.Buffer is truncated, and a
+// writer with Seek and Truncate(int64) error, such as an *os.File, is
+// truncated back to where the download began. Any other writer already passed
+// the bytes on, so the error is returned instead.
+//
 // It returns an [*Error] with StatusCode 409 and Code "batch_not_started",
 // "archive_not_requested", "archive_too_large" or "archive_unavailable" when
 // there is no archive, and 410 when the archive (or a draft) expired.
@@ -549,12 +556,21 @@ func (c *Client) DownloadBatchArchiveTo(ctx context.Context, id string, w io.Wri
 	}
 	deadline := time.Now().Add(timeout)
 	target := c.baseURL + "/watermarks/batches/" + id + "/archive"
+	rewind := rewinder(w)
 	for {
 		n, done, delay, err := c.archiveAttempt(ctx, target, w)
 		if done {
 			return n, err
 		}
 		remaining := time.Until(deadline)
+		if n > 0 {
+			// The connection dropped mid-zip. The archive route serves no Range requests:
+			// take back what was written and start over, or return the error when that is
+			// not possible, so a second copy is never appended.
+			if rewind == nil || remaining <= 0 || rewind(n) != nil {
+				return n, err
+			}
+		}
 		if remaining <= 0 {
 			detail := fmt.Sprintf("the archive of batch %s is not ready yet after %s", id, timeout)
 			if err != nil {
@@ -570,7 +586,8 @@ func (c *Client) DownloadBatchArchiveTo(ctx context.Context, id string, w io.Wri
 
 // archiveAttempt requests the archive once. done is false when the caller
 // should wait delay and ask again (HTTP 202, a retryable status or a transport
-// failure before any byte of the zip was written).
+// failure); n is then the bytes already written to w, which the caller must
+// take back first.
 func (c *Client) archiveAttempt(ctx context.Context, target string, w io.Writer) (n int64, done bool, delay time.Duration, err error) {
 	attempt, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -621,25 +638,66 @@ func (c *Client) archiveAttempt(ctx context.Context, target string, w io.Writer)
 		}
 		return &Error{StatusCode: 200, Detail: "reading the archive failed", RequestID: requestID, err: cause}
 	}
+	// A dropped or stalled connection can be asked again; a canceled context or a
+	// failing writer cannot.
+	failed := func(n int64, cause error) (int64, bool, time.Duration, error) {
+		failure := stalled(cause)
+		return n, ctx.Err() != nil || sink.err != nil, time.Second, failure
+	}
 	head := make([]byte, 2)
 	if _, err := io.ReadFull(body, head); err != nil || string(head) != "PK" {
 		if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
-			return 0, true, 0, stalled(err)
+			return failed(0, err)
 		}
 		return 0, true, 0, &Error{StatusCode: 200, Detail: "invalid archive response", RequestID: requestID}
 	}
 	if _, err := sink.Write(head); err != nil {
-		return 0, true, 0, stalled(err)
+		return failed(0, err)
 	}
 	copied, err := io.Copy(sink, io.LimitReader(body, MaxBatchArchiveSize-int64(len(head))+1))
 	n = copied + int64(len(head))
 	if err != nil {
-		return n, true, 0, stalled(err)
+		return failed(n, err)
 	}
 	if n > MaxBatchArchiveSize {
 		return n, true, 0, &Error{StatusCode: 200, Code: "archive_too_large", Detail: fmt.Sprintf("archive exceeds %d MB", MaxBatchArchiveSize/(1024*1024)), RequestID: requestID}
 	}
 	return n, true, 0, nil
+}
+
+// rewinder returns how to take back the n bytes a download attempt wrote to w,
+// or nil when w cannot rewind and truncate.
+func rewinder(w io.Writer) func(n int64) error {
+	switch w := w.(type) {
+	case *bytes.Buffer:
+		start := w.Len()
+		return func(int64) error {
+			w.Truncate(start)
+			return nil
+		}
+	case interface {
+		io.Seeker
+		Truncate(size int64) error
+	}:
+		if _, err := w.Seek(0, io.SeekCurrent); err != nil {
+			return nil // A pipe or terminal.
+		}
+		return func(n int64) error {
+			// The attempt's bytes end at the current offset. Counting back from there, rather
+			// than from the offset before the download, also holds for a file opened with
+			// O_APPEND, whose writes land at the end whatever its offset was.
+			end, err := w.Seek(0, io.SeekCurrent)
+			if err != nil {
+				return err
+			}
+			if err := w.Truncate(end - n); err != nil {
+				return err
+			}
+			_, err = w.Seek(end-n, io.SeekStart)
+			return err
+		}
+	}
+	return nil
 }
 
 // CancelBatch stops a batch: files not yet running fail as "cancelled" and are

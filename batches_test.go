@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -472,7 +473,9 @@ func TestArchivePollingOutlastsTheClientTimeout(t *testing.T) {
 }
 
 func TestArchiveDownloadStallIsReported(t *testing.T) {
+	var attempts atomic.Int32
 	server := newBatchServer(t, func(w http.ResponseWriter, r *http.Request, body []byte) bool {
+		attempts.Add(1)
 		w.Header().Set("Content-Type", "application/zip")
 		w.Header().Set("Content-Length", "1000")
 		_, _ = w.Write([]byte("PK\x03\x04"))
@@ -480,9 +483,87 @@ func TestArchiveDownloadStallIsReported(t *testing.T) {
 		<-r.Context().Done() // never sends the rest
 		return true
 	})
-	_, err := timedClient(t, server, 200*time.Millisecond).DownloadBatchArchive(context.Background(), testBatchID, time.Minute)
-	if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "stalled") {
-		t.Fatalf("stall: %v", err)
+	// A stall starts the download again until the archive timeout, then is reported.
+	_, err := timedClient(t, server, 200*time.Millisecond).DownloadBatchArchive(context.Background(), testBatchID, 700*time.Millisecond)
+	if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "stalled") || attempts.Load() < 2 {
+		t.Fatalf("stall: %v after %d attempts", err, attempts.Load())
+	}
+}
+
+// droppingArchive serves a zip whose odd attempts break off after its first
+// half, as a reset connection does.
+func droppingArchive(t *testing.T, zip []byte) (*batchServer, *int) {
+	attempts := 0
+	server := newBatchServer(t, func(w http.ResponseWriter, r *http.Request, body []byte) bool {
+		if r.Header.Get("Range") != "" {
+			t.Error("the archive route serves no Range requests")
+		}
+		attempts++
+		w.Header().Set("Content-Type", "application/zip")
+		w.Header().Set("Content-Length", strconv.Itoa(len(zip)))
+		if attempts%2 == 1 {
+			_, _ = w.Write(zip[:len(zip)/2])
+			w.(http.Flusher).Flush()
+			drop(t, w)
+			return true
+		}
+		_, _ = w.Write(zip)
+		return true
+	})
+	return server, &attempts
+}
+
+func TestADroppedArchiveStartsAgainFromTheBeginning(t *testing.T) {
+	zip := []byte("PK\x03\x04" + strings.Repeat("z", 64*1024))
+	server, attempts := droppingArchive(t, zip)
+	c := server.client(t)
+	got, err := c.DownloadBatchArchive(context.Background(), testBatchID, time.Minute)
+	if err != nil || !bytes.Equal(got, zip) {
+		t.Fatalf("in memory: %d bytes, %v", len(got), err)
+	}
+	file, err := os.Create(filepath.Join(t.TempDir(), "out.zip"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	_, _ = file.WriteString("header")
+	n, err := c.DownloadBatchArchiveTo(context.Background(), testBatchID, file, time.Minute)
+	written, _ := os.ReadFile(file.Name())
+	if err != nil || n != int64(len(zip)) || string(written) != "header"+string(zip) {
+		t.Fatalf("file: %d %v, %d bytes", n, err, len(written))
+	}
+	if *attempts != 4 {
+		t.Fatalf("attempts: %d", *attempts)
+	}
+}
+
+func TestADroppedArchiveKeepsWhatAnAppendOnlyFileHeld(t *testing.T) {
+	zip := []byte("PK\x03\x04" + strings.Repeat("z", 64*1024))
+	server, attempts := droppingArchive(t, zip)
+	name := filepath.Join(t.TempDir(), "log.zip")
+	if err := os.WriteFile(name, []byte("existing"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// O_APPEND writes land at the end although the offset starts at 0.
+	file, err := os.OpenFile(name, os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	n, err := server.client(t).DownloadBatchArchiveTo(context.Background(), testBatchID, file, time.Minute)
+	written, _ := os.ReadFile(name)
+	if err != nil || n != int64(len(zip)) || string(written) != "existing"+string(zip) || *attempts != 2 {
+		t.Fatalf("%d %v, %d bytes after %d attempts", n, err, len(written), *attempts)
+	}
+}
+
+func TestADroppedArchiveIntoAWriterThatCannotRewindFails(t *testing.T) {
+	zip := []byte("PK\x03\x04" + strings.Repeat("z", 64*1024))
+	server, attempts := droppingArchive(t, zip)
+	var sink strings.Builder
+	n, err := server.client(t).DownloadBatchArchiveTo(context.Background(), testBatchID, &sink, time.Minute)
+	if err == nil || n == 0 || int64(sink.Len()) != n || *attempts != 1 {
+		t.Fatalf("%d bytes, %v after %d attempts", n, err, *attempts)
 	}
 }
 
